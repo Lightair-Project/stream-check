@@ -278,6 +278,10 @@ async fn a_whip_publisher_is_ingested_recorded_and_reported() {
     assert_eq!((st["audio"]["codec"].as_str(), st["audio"]["sample_rate"].as_u64()), (Some("opus"), Some(48000)));
     assert!((st["video"]["fps"].as_f64().unwrap() - 30.0).abs() < 3.0, "fps {}", st["video"]["fps"]);
     assert_eq!(report["protocols"][0], "whip");
+    // RTP statistics are reported for WebRTC, and on a clean local link nothing is lost
+    assert_eq!(st["rtp"]["active"], true);
+    assert_eq!(st["rtp"]["video"]["lost"], 0);
+    assert!(st["rtp"]["video"]["pictures"].as_u64().unwrap() > 40);
     let seg = &report["segments"][0];
     assert_eq!(seg["container"], "mkv");
     let codecs: Vec<&str> =

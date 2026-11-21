@@ -14,6 +14,7 @@ pub mod nal;
 pub mod net;
 pub mod profiles;
 pub mod rtmp;
+pub mod rtp;
 pub mod srt;
 pub mod tls;
 pub mod ts;

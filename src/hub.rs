@@ -311,6 +311,7 @@ pub struct Inner {
     epoch: u64,
     segment_no: u32,
     finalizing: bool,
+    last_rtp_event: Option<Instant>,
 }
 
 pub struct Session {
@@ -383,6 +384,11 @@ impl Publisher {
     /// Bytes of the container to keep as they came (FLV tags, TS packets).
     pub fn raw(&self, bytes: &[u8]) {
         self.session.raw(self.conn, bytes);
+    }
+
+    /// RTP statistics of a track (WHIP).
+    pub fn rtp(&self, audio: bool, stats: crate::rtp::RtpStats) {
+        self.session.set_rtp(self.conn, audio, stats);
     }
 
     pub fn effective(&self) -> Effective {
@@ -729,6 +735,7 @@ impl Hub {
                 epoch: 0,
                 segment_no: 0,
                 finalizing: false,
+                last_rtp_event: None,
             }),
             preview: broadcast::channel(256).0,
         });
@@ -919,6 +926,36 @@ impl Session {
         let mut g = self.inner.lock();
         let notes = g.analyzer.set_levels(l, Instant::now());
         self.push_notes(&mut g, notes);
+    }
+
+    pub fn set_rtp(&self, conn: u64, audio: bool, stats: crate::rtp::RtpStats) {
+        let mut g = self.inner.lock();
+        if g.conn.map(|c| c.0) != Some(conn) {
+            return;
+        }
+        let now = Instant::now();
+        let slot = if audio { &g.analyzer.stats.rtp.audio } else { &g.analyzer.stats.rtp.video };
+        let worse = (stats.lost + stats.late + stats.pictures_dropped) > (slot.lost + slot.late + slot.pictures_dropped);
+        let better = stats.recovered > slot.recovered;
+        let quiet = g.last_rtp_event.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(2));
+        if (worse || better) && quiet {
+            g.last_rtp_event = Some(now);
+            let which = if audio { "audio" } else { "video" };
+            let msg = format!(
+                "RTP {which}: {} lost, {} recovered by retransmission or reordering, {} too late (dropped){}",
+                stats.lost,
+                stats.recovered,
+                stats.late,
+                if audio { String::new() } else { format!(", {} picture(s) dropped for missing packets", stats.pictures_dropped) }
+            );
+            self.push_event(&mut g, if worse { Level::Warn } else { Level::Info }, "rtp", msg);
+        }
+        g.analyzer.stats.rtp.active = true;
+        if audio {
+            g.analyzer.stats.rtp.audio = stats;
+        } else {
+            g.analyzer.stats.rtp.video = stats;
+        }
     }
 
     pub fn raw(&self, conn: u64, bytes: &[u8]) {

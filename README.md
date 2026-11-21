@@ -160,6 +160,10 @@ thumbnails with their times, and the event log. Stalls, gaps and reconnects are 
 - Timing numbers (fps, bitrate, keyframe interval) come from the stream's own timestamps and from arrival
   times, both shown where they differ. WHIP carries no common clock for picture and sound without RTCP
   sender reports, so the A/V offset of a WHIP stream is only as good as the first packets' arrival.
+- WHIP video and audio go through a small jitter buffer that restores sequence order: a packet that arrives late or as a
+  retransmission (NACK, or RFC 4588 RTX, which the WebRTC stack unwraps) in time is slotted into its place; one that arrives
+  after the buffer gave up is dropped and counted, never taken for a new picture. A picture with missing packets is dropped
+  (counted as such). The report's `stats.rtp` has `lost`, `recovered`, `late`, `duplicates` and pictures dropped per track.
 - RTMP recordings are the FLV tags as sent; SRT recordings the transport stream as sent; WHIP recordings are
   written as Matroska.
 

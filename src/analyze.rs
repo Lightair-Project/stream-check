@@ -140,8 +140,17 @@ pub struct Sample {
     pub av_offset_ms: Option<f64>,
 }
 
+/// RTP receive statistics per track (WHIP only).
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct RtpPair {
+    pub active: bool,
+    pub video: crate::rtp::RtpStats,
+    pub audio: crate::rtp::RtpStats,
+}
+
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Stats {
+    pub rtp: RtpPair,
     pub video: VideoStats,
     pub audio: AudioStats,
     pub levels: Levels,

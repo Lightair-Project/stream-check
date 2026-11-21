@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use rtc::interceptor::Registry;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
-use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine};
+use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_RTX, MediaEngine};
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind};
 use tokio::sync::mpsc;
@@ -26,6 +26,7 @@ use crate::analyze::Level;
 use crate::hub::{Hub, Proto, Publisher};
 use crate::media::{ACodec, AnnexB, Media, opus_toc};
 use crate::nal::VCodec;
+use crate::rtp::{AudioOrder, VideoAssembler};
 
 struct Handler {
     gathered: mpsc::Sender<()>,
@@ -70,6 +71,23 @@ fn codecs() -> Vec<(RTCRtpCodecParameters, RtpCodecKind)> {
                     rtcp_feedback: vec![],
                 },
                 payload_type: 102 + i as u8,
+            },
+            RtpCodecKind::Video,
+        ));
+    }
+    // retransmissions the RFC 4588 way, one RTX payload type per H.264 one; the WebRTC stack
+    // unwraps them (original sequence number back, primary SSRC) before they reach `read_track`
+    for i in 0..5u8 {
+        out.push((
+            RTCRtpCodecParameters {
+                rtp_codec: RTCRtpCodec {
+                    mime_type: MIME_TYPE_RTX.to_owned(),
+                    clock_rate: 90_000,
+                    channels: 0,
+                    sdp_fmtp_line: format!("apt={}", 102 + i),
+                    rtcp_feedback: vec![],
+                },
+                payload_type: 112 + i,
             },
             RtpCodecKind::Video,
         ));
@@ -163,75 +181,85 @@ impl Clock {
     }
 }
 
-/// Reads one track's RTP until it ends, feeding the publisher.
+/// Reads one track's RTP until it ends, feeding the publisher: packets are put in sequence order
+/// first (late and retransmitted ones included), then pictures are built from them.
 async fn read_track(track: Arc<dyn TrackRemote>, publisher: Arc<Publisher>, started: Instant) {
+    enum Ev {
+        Packet(u16, u32, bool, Vec<u8>),
+        Tick,
+        End,
+    }
     let kind = track.kind().await;
-    let mut depay = H264Depay::default();
+    let audio = kind == RtpCodecKind::Audio;
+    let mut video = VideoAssembler::new();
+    let mut opus = AudioOrder::new();
     let mut annexb = AnnexB::new(VCodec::H264);
     let mut clock: Option<Clock> = None;
-    let mut frame_ts: Option<u32> = None;
-    let mut last_seq: Option<u16> = None;
-    let mut corrupt = false;
-    let mut lost_total = 0u64;
-    let mut last_report = Instant::now();
     let mut audio_cfg = false;
-    while let Some(e) = track.poll().await {
-        let TrackRemoteEvent::OnRtpPacket(pkt) = e else { continue };
-        let h = &pkt.header;
-        if let Some(prev) = last_seq {
-            let gap = h.sequence_number.wrapping_sub(prev).wrapping_sub(1);
-            if gap != 0 && gap < 1000 {
-                lost_total += gap as u64;
-                corrupt = true;
-                depay.lost();
-                if last_report.elapsed() > Duration::from_secs(1) {
-                    last_report = Instant::now();
-                    publisher.session.event(Level::Warn, "rtp-loss", format!("{lost_total} RTP packets lost so far on the {kind} track"));
+    let mut tick = tokio::time::interval(Duration::from_millis(20));
+    let mut last_stats = Instant::now();
+    loop {
+        let ev = tokio::select! {
+            e = track.poll() => match e {
+                Some(TrackRemoteEvent::OnRtpPacket(p)) => Ev::Packet(p.header.sequence_number, p.header.timestamp, p.header.marker, p.payload.to_vec()),
+                Some(_) => continue,
+                None => Ev::End,
+            },
+            _ = tick.tick() => Ev::Tick,
+        };
+        let now = Instant::now();
+        let end = matches!(ev, Ev::End);
+        let mut pictures = vec![];
+        let mut packets = vec![];
+        match ev {
+            Ev::Packet(seq, ts, marker, payload) => {
+                if audio {
+                    packets = opus.push(seq, ts, &payload, now);
+                } else {
+                    pictures = video.push(seq, ts, marker, &payload, now);
+                }
+            }
+            Ev::Tick => {
+                if audio {
+                    packets = opus.tick(now);
+                } else {
+                    pictures = video.tick(now);
+                }
+            }
+            Ev::End => {
+                if !audio {
+                    pictures = video.finish();
                 }
             }
         }
-        last_seq = Some(h.sequence_number);
-        let c = clock.get_or_insert_with(|| {
-            Clock::new(h.timestamp, started.elapsed().as_micros() as i64, if kind == RtpCodecKind::Audio { 48_000 } else { 90_000 })
-        });
-        if kind == RtpCodecKind::Audio {
-            let pts = c.us(h.timestamp);
+        let rate = if audio { 48_000 } else { 90_000 };
+        for p in packets {
+            let c = clock.get_or_insert_with(|| Clock::new(p.ts, started.elapsed().as_micros() as i64, rate));
+            let pts = c.us(p.ts);
             if !audio_cfg {
                 audio_cfg = true;
-                let ch = opus_toc(&pkt.payload).map_or(2, |t| t.1);
+                let ch = opus_toc(&p.payload).map_or(2, |t| t.1);
                 publisher.media(Media::AudioConfig { codec: ACodec::Opus, config: Arc::new(vec![]), sample_rate: 48000, channels: ch });
             }
-            publisher.media(Media::Audio { pts_us: pts, data: Arc::new(pkt.payload.to_vec()) });
-            continue;
+            publisher.media(Media::Audio { pts_us: pts, data: Arc::new(p.payload) });
         }
-        // video: a new timestamp ends the picture before it
-        if frame_ts.is_some_and(|t| t != h.timestamp) {
-            flush(&mut depay, &mut annexb, c, frame_ts.unwrap(), &mut corrupt, &publisher);
+        for pic in pictures {
+            let c = clock.get_or_insert_with(|| Clock::new(pic.ts, started.elapsed().as_micros() as i64, rate));
+            let pts = c.us(pic.ts);
+            let refs: Vec<&[u8]> = pic.nals.iter().map(|n| n.as_slice()).collect();
+            let mut out = vec![];
+            annexb.picture(&refs, pts, pts, &mut out);
+            for m in out {
+                publisher.media(m);
+            }
         }
-        frame_ts = Some(h.timestamp);
-        depay.push(&pkt.payload);
-        if h.marker {
-            flush(&mut depay, &mut annexb, c, h.timestamp, &mut corrupt, &publisher);
-            frame_ts = None;
+        if end || last_stats.elapsed() >= Duration::from_millis(500) {
+            last_stats = Instant::now();
+            publisher.rtp(audio, if audio { opus.stats() } else { video.stats() });
         }
-    }
-}
-
-fn flush(depay: &mut H264Depay, annexb: &mut AnnexB, c: &mut Clock, ts: u32, corrupt: &mut bool, publisher: &Publisher) {
-    let nals = std::mem::take(&mut depay.nals);
-    if nals.is_empty() {
-        return;
-    }
-    if std::mem::take(corrupt) {
-        publisher.session.event(Level::Warn, "picture-lost", "a picture was dropped: RTP packets of it were lost".to_string());
-        return;
-    }
-    let pts = c.us(ts);
-    let refs: Vec<&[u8]> = nals.iter().map(|n| n.as_slice()).collect();
-    let mut out = vec![];
-    annexb.picture(&refs, pts, pts, &mut out);
-    for m in out {
-        publisher.media(m);
+        if end {
+            return;
+        }
     }
 }
 

@@ -188,7 +188,7 @@ function makeCard(s0) {
   const stats = el("div", { class: "stats" },
     stat("video", "Video"), stat("res", "Resolution"), stat("fps", "Frame rate"), stat("vbr", "Video bitrate"), stat("key", "Keyframe interval"), stat("gop", "GOP"),
     stat("ts", "Timestamps"), stat("stall", "Stalls"), stat("av", "A/V offset"), stat("drift", "A/V drift"),
-    stat("audio", "Audio"), stat("loud", "Loudness (M / S / I)"), stat("sil", "Silence"), stat("sess", "Session"));
+    stat("audio", "Audio"), stat("loud", "Loudness (M / S / I)"), stat("sil", "Silence"), stat("rtp", "RTP (lost / repaired / late)"), stat("sess", "Session"));
   const viol = el("div", { class: "viol" });
   const gcan = ["Bitrate kbps", "Frames per second", "Audio level dB"].map(l => { const c = el("canvas", { width: 300, height: 46 }); const v = el("span", {}, ""); return { c, v, wrap: el("div", {}, el("label", {}, l, v), c) }; });
   const graphs = el("div", { class: "graphs" }, ...gcan.map(g => g.wrap));
@@ -310,6 +310,8 @@ function makeCard(s0) {
     set("audio", a.codec ? `${a.codec.toUpperCase()} ${a.sample_rate} Hz · ${a.channels} ch · ${fmt(a.kbps, 0)} kbps` : "–");
     set("loud", lv.available ? `${fmt(lv.momentary_lufs)} / ${fmt(lv.short_term_lufs)} / ${fmt(lv.integrated_lufs)} LUFS` : "needs ffmpeg");
     set("sil", lv.silent ? "SILENT now" : lv.silence_events ? `${lv.silence_events} time(s), ${fmt(lv.silence_total_s, 0)} s` : "none", lv.silent ? "bad" : lv.silence_events ? "warn" : "");
+    const rtp = st.rtp; const rl = rtp.video.lost + rtp.audio.lost, rr = rtp.video.recovered + rtp.audio.recovered, rt = rtp.video.late + rtp.audio.late;
+    set("rtp", rtp.active ? `${rl} / ${rr} / ${rt}${rtp.video.pictures_dropped ? " · " + rtp.video.pictures_dropped + " picture(s) dropped" : ""}` : "n/a (not WebRTC)", rl || rt ? "warn" : "");
     set("sess", `${s.reconnects} reconnect(s), grace used ${s.grace_uses}× (${s.grace_s} s)`);
     meter(mL, lv.peak_l_db); meter(mR, lv.peak_r_db);
     lufs.textContent = lv.available ? `momentary ${fmt(lv.momentary_lufs)} LUFS · integrated ${fmt(lv.integrated_lufs)} LUFS · max peak ${fmt(lv.max_peak_db)} dBFS${lv.clipped_blocks ? " · CLIPPING" : ""}` : "levels need ffmpeg on this machine";
