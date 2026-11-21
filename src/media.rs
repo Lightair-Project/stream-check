@@ -1,0 +1,178 @@
+//! What every ingest hands to the lab: the same few events whatever the protocol was.
+
+use std::sync::Arc;
+
+use serde::Serialize;
+
+use crate::nal::{self, HevcPps, VCodec};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ACodec {
+    Aac,
+    Opus,
+}
+
+impl ACodec {
+    pub fn name(self) -> &'static str {
+        match self {
+            ACodec::Aac => "AAC",
+            ACodec::Opus => "Opus",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Media {
+    /// avcC or hvcC: the parameter sets (before the first picture, and again when they change).
+    VideoConfig { codec: VCodec, record: Arc<Vec<u8>> },
+    /// AudioSpecificConfig for AAC; empty for Opus.
+    AudioConfig { codec: ACodec, config: Arc<Vec<u8>>, sample_rate: u32, channels: u8 },
+    /// One picture: 4-byte length-prefixed NAL units. Times in microseconds.
+    Video { pts_us: i64, dts_us: i64, key: bool, data: Arc<Vec<u8>> },
+    /// One AAC access unit (raw, no ADTS) or one Opus packet.
+    Audio { pts_us: i64, data: Arc<Vec<u8>> },
+    /// The sender's own description of the stream (RTMP onMetaData).
+    Metadata(serde_json::Value),
+}
+
+/// Turns Annex B pictures (MPEG-TS, RTP) into [`Media`]: parameter sets are collected into a
+/// config record, and a picture goes out length-prefixed without them.
+pub struct AnnexB {
+    pub codec: VCodec,
+    vps: Vec<Vec<u8>>,
+    sps: Vec<Vec<u8>>,
+    pps: Vec<Vec<u8>>,
+    sent: Option<nal::ParameterSets>,
+}
+
+impl AnnexB {
+    pub fn new(codec: VCodec) -> Self {
+        AnnexB { codec, vps: vec![], sps: vec![], pps: vec![], sent: None }
+    }
+
+    /// One access unit as NAL units (start codes removed).
+    pub fn picture(&mut self, nals: &[&[u8]], pts_us: i64, dts_us: i64, out: &mut Vec<Media>) {
+        let mut rest: Vec<&[u8]> = vec![];
+        let mut key = false;
+        let mut changed = false;
+        for n in nals {
+            if n.is_empty() {
+                continue;
+            }
+            let t = nal::nal_type(self.codec, n);
+            let set = match (self.codec, t) {
+                (VCodec::Hevc, 32) => Some(&mut self.vps),
+                (VCodec::H264, 7) | (VCodec::Hevc, 33) => Some(&mut self.sps),
+                (VCodec::H264, 8) | (VCodec::Hevc, 34) => Some(&mut self.pps),
+                _ => None,
+            };
+            if let Some(set) = set {
+                if !set.iter().any(|s| s == n) {
+                    // a changed set replaces the old one of its kind
+                    if set.len() >= 4 {
+                        set.clear();
+                    }
+                    set.push(n.to_vec());
+                    changed = true;
+                }
+                continue;
+            }
+            // access unit delimiter, SEI: not picture data, kept out of the length-prefixed unit
+            if matches!((self.codec, t), (VCodec::H264, 9) | (VCodec::Hevc, 35)) {
+                continue;
+            }
+            key |= nal::is_keyframe_nal(self.codec, t);
+            rest.push(n);
+        }
+        if changed || self.sent.is_none() {
+            let record = match self.codec {
+                VCodec::H264 => nal::build_avcc(&self.sps, &self.pps),
+                VCodec::Hevc => nal::build_hvcc(&self.vps, &self.sps, &self.pps),
+            };
+            let now = (self.vps.clone(), self.sps.clone(), self.pps.clone());
+            if let Some(record) = record {
+                if self.sent.as_ref() != Some(&now) {
+                    self.sent = Some(now);
+                    out.push(Media::VideoConfig { codec: self.codec, record: Arc::new(record) });
+                }
+            }
+        }
+        if self.sent.is_some() && rest.iter().any(|n| nal::is_slice(self.codec, nal::nal_type(self.codec, n))) {
+            out.push(Media::Video { pts_us, dts_us, key, data: Arc::new(nal::to_lengths(&rest)) });
+        }
+    }
+}
+
+/// The audio config of AAC-LC and friends: (sample rate, channels) out of an
+/// AudioSpecificConfig.
+pub fn read_asc(asc: &[u8]) -> Option<(u32, u8, u8)> {
+    const RATES: [u32; 13] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+    let mut b = nal::Bits::new(asc);
+    let mut object = b.u(5)? as u8;
+    if object == 31 {
+        object = 32 + b.u(6)? as u8;
+    }
+    let idx = b.u(4)? as usize;
+    let rate = if idx == 15 { b.u(24)? as u32 } else { *RATES.get(idx)? };
+    let channels = b.u(4)? as u8;
+    Some((rate, channels, object))
+}
+
+/// An AudioSpecificConfig (AAC-LC) for a sample rate and channel count.
+pub fn make_asc(object: u8, rate: u32, channels: u8) -> Vec<u8> {
+    const RATES: [u32; 13] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+    let idx = RATES.iter().position(|&r| r == rate).unwrap_or(3) as u16;
+    let v: u16 = ((object as u16) << 11) | (idx << 7) | ((channels as u16) << 3);
+    v.to_be_bytes().to_vec()
+}
+
+/// Opus packet facts from its TOC byte: frame duration in microseconds and channel layout.
+pub fn opus_toc(packet: &[u8]) -> Option<(u32, u8)> {
+    let toc = *packet.first()?;
+    let config = toc >> 3;
+    let frame_us = match config {
+        0..=11 => [10_000, 20_000, 40_000, 60_000][(config & 3) as usize],
+        12..=15 => [10_000, 20_000][(config & 1) as usize],
+        _ => [2_500, 5_000, 10_000, 20_000][(config & 3) as usize],
+    };
+    let frames = match toc & 3 {
+        0 => 1,
+        1 | 2 => 2,
+        _ => (*packet.get(1)? & 0x3f) as u32,
+    };
+    Some((frame_us * frames, if toc & 4 != 0 { 2 } else { 1 }))
+}
+
+pub type PpsList = Vec<(u64, HevcPps)>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asc_roundtrips_and_opus_toc_reads() {
+        assert_eq!(make_asc(2, 48000, 2), vec![0x11, 0x90]);
+        assert_eq!(read_asc(&[0x11, 0x90]), Some((48000, 2, 2)));
+        // 20 ms CELT fullband stereo, one frame
+        assert_eq!(opus_toc(&[0xfc, 0xff]), Some((20_000, 2)));
+    }
+
+    #[test]
+    fn annexb_pictures_become_config_then_length_prefixed_video() {
+        let sps = [0x67u8, 0x64, 0x00, 0x1f, 0xac, 0xd9, 0x40, 0x50, 0x05, 0xbb, 0x01, 0x10];
+        let pps = [0x68u8, 0xeb, 0xe3, 0xcb];
+        let idr = [0x65u8, 0x88, 0x84];
+        let mut a = AnnexB::new(VCodec::H264);
+        let mut out = vec![];
+        a.picture(&[&sps, &pps, &idr], 0, 0, &mut out);
+        assert!(matches!(out[0], Media::VideoConfig { .. }));
+        let Media::Video { key, ref data, .. } = out[1] else { panic!() };
+        assert!(key);
+        assert_eq!(&data[..], [0, 0, 0, 3, 0x65, 0x88, 0x84]);
+        // the same sets again: no new config
+        let mut out = vec![];
+        a.picture(&[&sps, &pps, &idr], 33_000, 33_000, &mut out);
+        assert_eq!(out.len(), 1);
+    }
+}

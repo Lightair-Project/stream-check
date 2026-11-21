@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stream Check</title>
+<style>
+:root{--bg:#0f1115;--panel:#171a21;--panel2:#1e222b;--line:#2a2f3a;--text:#e6e8ee;--dim:#8b93a3;--accent:#4f9dff;--ok:#38c172;--warn:#f0b429;--bad:#ef5350;--live:#ef5350;color-scheme:dark}
+@media (prefers-color-scheme:light){:root{--bg:#f4f5f8;--panel:#fff;--panel2:#f0f2f6;--line:#d9dde6;--text:#1a1d24;--dim:#667085;--accent:#1f6fe0;color-scheme:light}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+header{display:flex;align-items:center;gap:16px;padding:12px 20px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:5}
+header h1{font-size:17px;margin:0;font-weight:650}
+header .sp{flex:1}
+button{font:inherit;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:4px 10px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+button.danger:hover{border-color:var(--bad);color:var(--bad)}
+main{padding:16px 20px;display:grid;gap:16px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px}
+.connect{padding:12px 16px;display:none}
+.connect.open{display:block}
+.connect .row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+.connect .body{display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start}
+.connect img{width:150px;height:150px;border-radius:6px;background:#fff}
+.urls{flex:1;min-width:280px;display:grid;gap:6px}
+.url{display:flex;gap:8px;align-items:center}
+.url b{width:60px;color:var(--dim);font-weight:500}
+.url code{flex:1;word-break:break-all;background:var(--panel2);padding:3px 6px;border-radius:4px;font-size:12.5px}
+.empty{padding:40px;text-align:center;color:var(--dim)}
+.grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fill,minmax(520px,1fr))}
+.card{overflow:hidden}
+.card.ended{opacity:.85}
+.ch{display:flex;gap:8px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.badge{font-size:11px;text-transform:uppercase;letter-spacing:.04em;padding:2px 7px;border-radius:99px;background:var(--panel2);border:1px solid var(--line)}
+.pill{font-size:11px;padding:2px 8px;border-radius:99px;font-weight:600;text-transform:uppercase}
+.pill.live{background:var(--live);color:#fff}
+.pill.grace{background:var(--warn);color:#000}
+.pill.ended{background:var(--panel2);color:var(--dim);border:1px solid var(--line)}
+.key{font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
+.dim{color:var(--dim)}
+.pv{position:relative;background:#000;aspect-ratio:16/9;max-height:380px;width:100%;display:flex;align-items:center;justify-content:center}
+.pv canvas,.pv img{width:100%;height:100%;object-fit:contain;display:block}
+.pv .msg{position:absolute;color:#9aa;font-size:13px;text-align:center;padding:10px}
+.pv .tools{position:absolute;right:8px;bottom:8px;display:flex;gap:6px}
+.meters{display:grid;grid-template-columns:auto 1fr auto;gap:2px 8px;padding:8px 14px;align-items:center;font-size:12px}
+.bar{height:8px;background:var(--panel2);border-radius:4px;position:relative;overflow:hidden}
+.bar i{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,var(--ok) 0 70%,var(--warn) 70% 92%,var(--bad) 92%);width:0;transition:width .15s}
+.stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:1px;background:var(--line);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.stat{background:var(--panel);padding:6px 12px}
+.stat label{display:block;font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim)}
+.stat span{font-variant-numeric:tabular-nums;font-size:13.5px}
+.stat.bad span{color:var(--bad)}.stat.warn span{color:var(--warn)}
+.viol{padding:8px 14px;display:flex;gap:6px;flex-wrap:wrap}
+.chip{font-size:12px;padding:2px 8px;border-radius:6px;border:1px solid var(--bad);color:var(--bad)}
+.chip.warn{border-color:var(--warn);color:var(--warn)}
+.chip.cleared{border-color:var(--line);color:var(--dim);text-decoration:line-through}
+.graphs{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:10px 14px}
+.graphs div{background:var(--panel2);border-radius:6px;padding:4px 6px}
+.graphs label{font-size:10.5px;color:var(--dim);text-transform:uppercase;display:flex;justify-content:space-between}
+.graphs canvas{width:100%;height:46px;display:block}
+.faults{display:flex;gap:6px;flex-wrap:wrap;padding:8px 14px;align-items:center;border-top:1px solid var(--line)}
+.faults .now{font-size:12px;color:var(--warn)}
+.thumbs{display:flex;gap:6px;overflow-x:auto;padding:8px 14px;border-top:1px solid var(--line)}
+.thumbs figure{margin:0;flex:0 0 auto;text-align:center}
+.thumbs img{height:54px;border-radius:4px;display:block;background:#000}
+.thumbs figcaption{font-size:10px;color:var(--dim)}
+.log{max-height:170px;overflow:auto;font:12px/1.5 ui-monospace,Menlo,monospace;padding:8px 14px;border-top:1px solid var(--line)}
+.log div{white-space:pre-wrap}
+.log .warn{color:var(--warn)}.log .error{color:var(--bad)}.log .t{color:var(--dim)}
+.links{padding:6px 14px 10px;font-size:12px;display:flex;gap:12px;flex-wrap:wrap}
+a{color:var(--accent)}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:8px 0 0}
+.rej{padding:8px 14px;font-size:12.5px}
+.rej div{padding:2px 0}
+</style>
+</head>
+<body>
+<header>
+  <h1>Stream Check</h1>
+  <span class="dim" id="sub">connecting…</span>
+  <span class="sp"></span>
+  <button id="btn-connect">Connect a sender</button>
+  <button id="btn-faultall" title="Faults for every stream">Faults for all…</button>
+</header>
+<main>
+  <section class="panel connect" id="connect"></section>
+  <section id="live"></section>
+  <section id="earlier"></section>
+  <section id="rejections"></section>
+</main>
+<script>
+"use strict";
+const $ = (s, r = document) => r.querySelector(s);
+const el = (tag, attrs = {}, ...kids) => { const e = document.createElement(tag); for (const [k, v] of Object.entries(attrs)) { if (k === "class") e.className = v; else if (k.startsWith("on")) e.addEventListener(k.slice(2), v); else e.setAttribute(k, v); } for (const k of kids) e.append(k); return e; };
+const fmt = (n, d = 1) => (n == null || !isFinite(n)) ? "–" : Number(n).toFixed(d);
+const dur = s => { s = Math.round(s || 0); const m = Math.floor(s / 60); return m ? `${m}m ${String(s % 60).padStart(2, "0")}s` : `${s}s`; };
+const cards = new Map();
+let state = null, hostIndex = 0, protoTab = "rtmp", platformTab = "open";
+let audioCtx = null, unmuted = null; // the card whose sound plays
+
+/* ---------- state socket ---------- */
+function connectState() {
+  const ws = new WebSocket(`ws://${location.host}/ws/state`);
+  ws.onmessage = e => { state = JSON.parse(e.data); render(); };
+  ws.onclose = () => { $("#sub").textContent = "disconnected; retrying…"; setTimeout(connectState, 1500); };
+}
+
+function render() {
+  const live = state.sessions.filter(s => s.state !== "ended");
+  const ended = state.sessions.filter(s => s.state === "ended");
+  $("#sub").textContent = `up ${dur(state.uptime_s)} · ${live.length} live · ${ended.length} ended`;
+  renderConnect();
+  const seen = new Set();
+  for (const s of state.sessions) { seen.add(s.id); let c = cards.get(s.id); if (!c) { c = makeCard(s); cards.set(s.id, c); } c.update(s); }
+  for (const [id, c] of cards) if (!seen.has(id)) { c.destroy(); cards.delete(id); }
+  fill($("#live"), "Live", live, "No stream yet. Point a sender at one of the addresses under “Connect a sender”.");
+  fill($("#earlier"), "Earlier sessions", ended, null);
+  const rej = state.rejections || [];
+  const box = $("#rejections");
+  box.replaceChildren();
+  if (rej.length) {
+    box.append(el("h2", {}, "Refused connections"));
+    const p = el("div", { class: "panel rej" });
+    for (const r of rej.slice(0, 8)) p.append(el("div", {}, `${new Date(r.wall_ms).toLocaleTimeString()} · ${r.proto.toUpperCase()} · ${r.platform}/${r.key || "(no key)"} from ${r.remote}: ${r.msg}`));
+    box.append(p);
+  }
+}
+
+function fill(root, title, list, emptyMsg) {
+  let grid = root.querySelector(".grid");
+  if (!list.length) { root.replaceChildren(emptyMsg ? el("div", { class: "panel empty" }, emptyMsg) : ""); return; }
+  if (!grid) { root.replaceChildren(el("h2", {}, title), grid = el("div", { class: "grid" })); }
+  const want = list.map(s => cards.get(s.id).root);
+  if (grid.children.length !== want.length || want.some((n, i) => grid.children[i] !== n)) grid.replaceChildren(...want);
+}
+
+/* ---------- connect panel ---------- */
+let lastConnectKey = "";
+function renderConnect() {
+  const a = state.addresses; if (!a || !a.hosts) return;
+  const h = a.hosts[Math.min(hostIndex, a.hosts.length - 1)];
+  const st = h.streams.find(s => s.platform === platformTab) || h.streams[0];
+  const urlFor = { rtmp: st.rtmp && st.rtmp.url, rtmps: st.rtmps && st.rtmps.url, srt: st.srt, whip: st.whip }[protoTab] || st.rtmp.url;
+  const k = [hostIndex, protoTab, platformTab, urlFor, a.srt_passphrase, a.whip_token].join("|");
+  if (k === lastConnectKey) return; lastConnectKey = k;
+  const box = $("#connect"); box.replaceChildren();
+  const hostRow = el("div", { class: "row" }, el("span", { class: "dim" }, "From: "));
+  a.hosts.forEach((x, i) => hostRow.append(el("button", { class: i === hostIndex ? "on" : "", onclick: () => { hostIndex = i; lastConnectKey = ""; renderConnect(); } }, `${x.label} (${x.host})`)));
+  const platRow = el("div", { class: "row" }, el("span", { class: "dim" }, "Platform: "));
+  for (const p of h.streams) platRow.append(el("button", { class: p.platform === platformTab ? "on" : "", onclick: () => { platformTab = p.platform; lastConnectKey = ""; renderConnect(); } }, p.platform));
+  const protoRow = el("div", { class: "row" }, el("span", { class: "dim" }, "Protocol: "));
+  for (const p of ["rtmp", "rtmps", "srt", "whip"]) if (p !== "rtmps" || st.rtmps) protoRow.append(el("button", { class: p === protoTab ? "on" : "", onclick: () => { protoTab = p; lastConnectKey = ""; renderConnect(); } }, p.toUpperCase()));
+  const urls = el("div", { class: "urls" });
+  const line = (label, value) => urls.append(el("div", { class: "url" }, el("b", {}, label), el("code", {}, value), el("button", { onclick: e => { navigator.clipboard && navigator.clipboard.writeText(value); e.target.textContent = "copied"; setTimeout(() => e.target.textContent = "copy", 900); } }, "copy")));
+  if (protoTab === "rtmp" || protoTab === "rtmps") { const r = st[protoTab]; line("Server", r.server); line("Key", r.key); line("Full URL", r.url); if (protoTab === "rtmps") urls.append(el("div", { class: "dim" }, "Self-signed certificate: the sender has to be told to accept it (in the data folder: tls/cert.pem)."));
+  } else if (protoTab === "srt") { line("URL", st.srt); if (!a.srt_passphrase) urls.append(el("div", { class: "dim" }, "No passphrase required. Start with --srt-passphrase to require one.")); }
+  else { line("Endpoint", st.whip); line("Bearer", a.whip_token || "(none required)"); }
+  urls.append(el("div", { class: "dim" }, `Key rule for ${st.platform}: ${st.platform === "open" ? "anything" : "must look like " + st.key}. Android emulator: use the “android-emulator” host.`));
+  box.append(hostRow, platRow, protoRow, el("div", { class: "body" }, el("img", { alt: "QR code", src: `/api/qr?text=${encodeURIComponent(urlFor)}` }), urls));
+}
+$("#btn-connect").onclick = () => $("#connect").classList.toggle("open");
+$("#btn-faultall").onclick = () => { const w = prompt("Fault for every stream: drop, refuse 10, freeze 10, throttle 500, latency 300, loss 5, clear", "refuse 10"); if (w) sendFault("*", w); };
+
+async function sendFault(target, text) {
+  const [what, n] = text.trim().split(/\s+/); const v = parseFloat(n);
+  const body = { drop: { drop: true }, refuse: { refuse_s: v }, freeze: { freeze_s: v }, throttle: { throttle_kbps: v }, latency: { latency_ms: v }, loss: { loss_pct: v }, clear: { clear: true } }[what];
+  if (!body) return alert("Unknown fault " + what);
+  await fetch(`/api/faults/${encodeURIComponent(target)}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+}
+
+/* ---------- a stream card ---------- */
+function makeCard(s0) {
+  const root = el("div", { class: "panel card" });
+  const stat = (k, label) => el("div", { class: "stat", "data-k": k }, el("label", {}, label), el("span", {}));
+  const head = el("div", { class: "ch" });
+  const canvas = el("canvas", { width: 640, height: 360 });
+  const still = el("img", { alt: "", style: "display:none" });
+  const msg = el("div", { class: "msg" }, "waiting for the first picture…");
+  const muteBtn = el("button", {}, "🔇 Unmute");
+  const tools = el("div", { class: "tools" }, muteBtn);
+  const pv = el("div", { class: "pv" }, canvas, still, msg, tools);
+  const meters = el("div", { class: "meters" });
+  const meterRow = (n) => { const bar = el("div", { class: "bar" }, el("i")); const val = el("span", { class: "dim" }, "–"); meters.append(el("span", { class: "dim" }, n), bar, val); return { bar: bar.firstChild, val }; };
+  const mL = meterRow("L"), mR = meterRow("R");
+  const lufs = el("div", { class: "dim", style: "grid-column:1/-1" }, "");
+  meters.append(lufs);
+  const stats = el("div", { class: "stats" },
+    stat("video", "Video"), stat("res", "Resolution"), stat("fps", "Frame rate"), stat("vbr", "Video bitrate"), stat("key", "Keyframe interval"), stat("gop", "GOP"),
+    stat("ts", "Timestamps"), stat("stall", "Stalls"), stat("av", "A/V offset"), stat("drift", "A/V drift"),
+    stat("audio", "Audio"), stat("loud", "Loudness (M / S / I)"), stat("sil", "Silence"), stat("sess", "Session"));
+  const viol = el("div", { class: "viol" });
+  const gcan = ["Bitrate kbps", "Frames per second", "Audio level dB"].map(l => { const c = el("canvas", { width: 300, height: 46 }); const v = el("span", {}, ""); return { c, v, wrap: el("div", {}, el("label", {}, l, v), c) }; });
+  const graphs = el("div", { class: "graphs" }, ...gcan.map(g => g.wrap));
+  const faults = el("div", { class: "faults" });
+  const faultNow = el("span", { class: "now" });
+  const mk = (label, text, cls = "") => el("button", { class: cls, onclick: () => sendFault(s0.key, text) }, label);
+  faults.append(mk("Drop", "drop", "danger"), mk("Refuse 10 s", "refuse 10", "danger"), mk("Freeze 10 s", "freeze 10"), mk("Throttle 500 kbps", "throttle 500"), mk("Latency 300 ms", "latency 300"), mk("Loss 5 %", "loss 5"), mk("Clear", "clear"), faultNow);
+  const thumbs = el("div", { class: "thumbs" });
+  const log = el("div", { class: "log" });
+  const links = el("div", { class: "links" });
+  root.append(head, pv, meters, stats, viol, graphs, faults, thumbs, log, links);
+
+  // preview
+  let ws = null, vdec = null, adec = null, gotKey = false, acfg = null, nextT = 0, destroyed = false, vcfgDone = false;
+  const ctx2d = canvas.getContext("2d");
+  const status = t => { msg.textContent = t; msg.style.display = t ? "" : "none"; };
+  function open() {
+    if (!("VideoDecoder" in window)) { status("This browser can't decode video (WebCodecs); showing thumbnails."); return; }
+    ws = new WebSocket(`ws://${location.host}/ws/preview/${encodeURIComponent(s0.id)}`);
+    ws.binaryType = "arraybuffer";
+    ws.onmessage = e => onMsg(new DataView(e.data), new Uint8Array(e.data));
+    ws.onclose = () => { if (!destroyed && cardState.state !== "ended") setTimeout(open, 1500); };
+  }
+  let lastCfg = null;
+  async function setupVideo(u8) {
+    lastCfg = u8;
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    const hevc = u8[1] === 1, n = u8[2], codec = new TextDecoder().decode(u8.slice(3, 3 + n));
+    const w = dv.getUint16(3 + n), h = dv.getUint16(5 + n), desc = u8.slice(7 + n);
+    const cfg = { codec, description: desc, codedWidth: w || undefined, codedHeight: h || undefined, optimizeForLatency: true };
+    let ok = false; try { ok = (await VideoDecoder.isConfigSupported(cfg)).supported; } catch { }
+    if (!ok) { status(`This browser can't decode ${hevc ? "HEVC" : "H.264"} (${codec}); showing thumbnails.`); vdec = null; return; }
+    if (vdec && vdec.state !== "closed") vdec.close();
+    const mine = new VideoDecoder({
+      output: f => { if (canvas.width !== f.displayWidth) { canvas.width = f.displayWidth; canvas.height = f.displayHeight; } ctx2d.drawImage(f, 0, 0); f.close(); status(""); },
+      error: e => { status("decoder: " + e.message + " (restarting at the next keyframe)"); if (vdec === mine && lastCfg && !destroyed) { vdec = null; setTimeout(() => setupVideo(lastCfg), 200); } }
+    });
+    vdec = mine; mine.configure(cfg); gotKey = false;
+  }
+  async function onMsg(dv, u8) {
+    const type = u8[0];
+    if (type === 1) {
+      await setupVideo(u8);
+    } else if (type === 2 && vdec && vdec.state === "configured") {
+      const key = u8[1] === 1; if (!gotKey && !key) return; gotKey = true;
+      if (vdec.decodeQueueSize > 120) { gotKey = false; return; } // behind: wait for the next keyframe
+      vdec.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: Number(dv.getBigInt64(2)), data: u8.subarray(10) }));
+    } else if (type === 3) {
+      const opus = u8[1] === 1, rate = dv.getUint32(2), ch = u8[6], desc = u8.slice(7);
+      acfg = opus ? { codec: "opus", sampleRate: 48000, numberOfChannels: Math.max(1, ch) } : { codec: "mp4a.40.2", sampleRate: rate, numberOfChannels: ch, description: desc };
+      if (unmuted === api) startAudio();
+    } else if (type === 4 && adec && adec.state === "configured") {
+      if (adec.decodeQueueSize > 20) return;
+      adec.decode(new EncodedAudioChunk({ type: "key", timestamp: Number(dv.getBigInt64(1)), data: u8.subarray(9) }));
+    }
+  }
+  function startAudio() {
+    if (!acfg || !("AudioDecoder" in window)) return;
+    audioCtx = audioCtx || new AudioContext({ latencyHint: "interactive" });
+    audioCtx.resume();
+    if (adec && adec.state !== "closed") adec.close();
+    adec = new AudioDecoder({
+      output: d => {
+        const n = d.numberOfFrames, ch = d.numberOfChannels, buf = audioCtx.createBuffer(ch, n, d.sampleRate);
+        for (let c = 0; c < ch; c++) { const a = new Float32Array(n); d.copyTo(a, { planeIndex: c, format: "f32-planar" }); buf.copyToChannel(a, c); }
+        d.close();
+        const src = audioCtx.createBufferSource(); src.buffer = buf; src.connect(audioCtx.destination);
+        const now = audioCtx.currentTime;
+        if (nextT < now + 0.03 || nextT > now + 0.6) nextT = now + 0.12;
+        src.start(nextT); nextT += buf.duration;
+      }, error: () => { }
+    });
+    adec.configure(acfg);
+  }
+  const api = { stop() { if (adec && adec.state !== "closed") adec.close(); adec = null; muteBtn.textContent = "🔇 Unmute"; } };
+  muteBtn.onclick = () => {
+    if (unmuted === api) { api.stop(); unmuted = null; return; }
+    if (unmuted) unmuted.stop();
+    unmuted = api; muteBtn.textContent = "🔊 Mute";
+    if (!acfg) { muteBtn.textContent = "🔊 Mute (no audio yet)"; }
+    startAudio();
+  };
+  setTimeout(open, 50);
+
+  let cardState = s0, logN = -1, thumbN = -1, headKey = "";
+  function spark(canvasEl, values, color, lo, hi) {
+    const c = canvasEl.getContext("2d"), w = canvasEl.width, h = canvasEl.height;
+    c.clearRect(0, 0, w, h); if (values.length < 2) return;
+    const max = hi != null ? hi : Math.max(1, ...values.filter(v => v != null)) * 1.15, min = lo != null ? lo : 0;
+    c.strokeStyle = color; c.lineWidth = 1.6; c.beginPath();
+    let started = false;
+    values.forEach((v, i) => { if (v == null) { started = false; return; } const x = i / (values.length - 1) * (w - 2) + 1, y = h - 2 - (Math.max(min, Math.min(max, v)) - min) / (max - min || 1) * (h - 4); if (!started) { c.moveTo(x, y); started = true; } else c.lineTo(x, y); });
+    c.stroke();
+  }
+  function meter(m, db) { const pct = db == null ? 0 : Math.max(0, Math.min(100, (db + 60) / 60 * 100)); m.bar.style.width = pct + "%"; m.val.textContent = db == null ? "–" : fmt(db) + " dB"; }
+  function set(k, text, cls) { const n = stats.querySelector(`[data-k="${k}"]`); n.lastChild.textContent = text; n.className = "stat" + (cls ? " " + cls : ""); }
+  function update(s) {
+    cardState = s;
+    const st = s.stats, v = st.video, a = st.audio, lv = st.levels, sps = v.sps;
+    const key = [s.id, s.state, s.connection && s.connection.protocol].join("|") + (s.state === "grace" ? "g" : "");
+    head.replaceChildren(el("span", { class: "badge" }, s.platform), el("span", { class: "key" }, s.key), el("span", { class: "pill " + s.state }, s.state === "grace" ? `waiting ${fmt(s.grace_left_s, 0)} s` : s.state),
+      el("span", { class: "dim" }, `${(s.protocols || []).join("+").toUpperCase()}${s.connection ? " from " + s.connection.remote : ""} · ${dur(s.duration_s)}`),
+      el("span", { style: "flex:1" }), s.state !== "ended" ? el("button", { class: "danger", onclick: () => fetch(`/api/sessions/${encodeURIComponent(s.id)}/end`, { method: "POST" }) }, "End") : "");
+    root.classList.toggle("ended", s.state === "ended");
+    still.style.display = vdec ? "none" : (s.thumbs.length ? "" : "none");
+    if (!vdec && s.thumbs.length) { still.src = `/media/${encodeURIComponent(s.id)}/thumbs/${s.thumbs[s.thumbs.length - 1].file}`; canvas.style.display = "none"; msg.style.display = "none"; } else canvas.style.display = "";
+    if (s.state === "ended" && !vdec) { if (!s.thumbs.length) status("session ended"); }
+    set("video", sps ? `${v.codec ? v.codec.toUpperCase() : ""} ${sps.profile} @ ${sps.level}` : "–");
+    set("res", sps ? `${sps.width}×${sps.height}` : "–");
+    set("fps", v.fps ? `${fmt(v.fps)}${sps && sps.declared_fps ? " (declares " + fmt(sps.declared_fps) + ")" : ""}` : "–");
+    set("vbr", v.kbps ? `${fmt(v.kbps, 0)} kbps (peak ${fmt(v.peak_kbps, 0)})` : "–");
+    set("key", v.keyint_last_s != null ? `${fmt(v.keyint_last_s, 2)} s (min ${fmt(v.keyint_min_s, 2)}, max ${fmt(v.keyint_max_s, 2)})` : (v.since_key_s != null ? `first, ${fmt(v.since_key_s, 1)} s in` : "–"), v.keyint_max_s > 4 ? "warn" : "");
+    set("gop", v.gop_frames ? `${v.gop_frames} frames: ${v.gop_pattern}${v.b_frames ? " · B-frames" : ""}` : "–");
+    const tsBad = v.dts_backwards + a.pts_backwards; const gaps = v.gaps + a.gaps;
+    set("ts", tsBad ? `${tsBad} backwards` : gaps ? `${gaps} gap(s), max ${fmt(Math.max(v.max_gap_ms, a.max_gap_ms), 0)} ms` : "monotonic", tsBad ? "bad" : gaps ? "warn" : "");
+    set("stall", st.stalls.count ? `${st.stalls.count} · longest ${fmt(st.stalls.longest_ms, 0)} ms${st.stalls.stalled_now ? " · NOW" : ""}` : (st.stalls.stalled_now ? "stalled now" : "none"), st.stalls.stalled_now ? "bad" : st.stalls.count ? "warn" : "");
+    set("av", st.av.offset_ms != null ? `${fmt(st.av.offset_ms, 0)} ms` : "–", st.av.offset_ms != null && Math.abs(st.av.offset_ms) > 100 ? "warn" : "");
+    set("drift", st.av.drift_ms != null ? `${fmt(st.av.drift_ms, 0)} ms${st.av.drift_ms_per_min != null ? " (" + fmt(st.av.drift_ms_per_min, 1) + "/min)" : ""}` : "–");
+    set("audio", a.codec ? `${a.codec.toUpperCase()} ${a.sample_rate} Hz · ${a.channels} ch · ${fmt(a.kbps, 0)} kbps` : "–");
+    set("loud", lv.available ? `${fmt(lv.momentary_lufs)} / ${fmt(lv.short_term_lufs)} / ${fmt(lv.integrated_lufs)} LUFS` : "needs ffmpeg");
+    set("sil", lv.silent ? "SILENT now" : lv.silence_events ? `${lv.silence_events} time(s), ${fmt(lv.silence_total_s, 0)} s` : "none", lv.silent ? "bad" : lv.silence_events ? "warn" : "");
+    set("sess", `${s.reconnects} reconnect(s), grace used ${s.grace_uses}× (${s.grace_s} s)`);
+    meter(mL, lv.peak_l_db); meter(mR, lv.peak_r_db);
+    lufs.textContent = lv.available ? `momentary ${fmt(lv.momentary_lufs)} LUFS · integrated ${fmt(lv.integrated_lufs)} LUFS · max peak ${fmt(lv.max_peak_db)} dBFS${lv.clipped_blocks ? " · CLIPPING" : ""}` : "levels need ffmpeg on this machine";
+    viol.replaceChildren(...s.violations.map(x => el("span", { class: "chip " + (x.active ? (x.level === "warn" ? "warn" : "") : "cleared"), title: x.msg }, `${x.rule}${x.count > 1 ? " ×" + x.count : ""}: ${x.msg}`)));
+    viol.style.display = s.violations.length ? "" : "none";
+    const ser = s.series;
+    spark(gcan[0].c, ser.map(p => p.video_kbps + p.audio_kbps), "#4f9dff"); gcan[0].v.textContent = fmt(v.kbps + a.kbps, 0);
+    spark(gcan[1].c, ser.map(p => p.fps), "#38c172"); gcan[1].v.textContent = fmt(v.fps_arrival);
+    spark(gcan[2].c, ser.map(p => p.peak_db), "#f0b429", -60, 0); gcan[2].v.textContent = lv.peak_l_db != null ? fmt(Math.max(lv.peak_l_db, lv.peak_r_db ?? -120)) : "–";
+    const f = s.faults, act = [];
+    if (f.refuse_left_s) act.push(`refusing ${fmt(f.refuse_left_s, 0)} s`); if (f.freeze_left_s) act.push(`frozen ${fmt(f.freeze_left_s, 0)} s`);
+    if (f.throttle_kbps) act.push(`throttle ${f.throttle_kbps} kbps`); if (f.latency_ms) act.push(`+${f.latency_ms} ms`); if (f.loss_pct) act.push(`${f.loss_pct}% loss`);
+    faultNow.textContent = act.length ? "active: " + act.join(", ") : "";
+    faults.style.display = s.state === "ended" ? "none" : "";
+    if (thumbN !== s.thumbs.length) { thumbN = s.thumbs.length; thumbs.replaceChildren(...s.thumbs.map(t => el("figure", {}, el("img", { loading: "lazy", src: `/media/${encodeURIComponent(s.id)}/thumbs/${t.file}` }), el("figcaption", {}, dur(t.t))))); thumbs.scrollLeft = thumbs.scrollWidth; }
+    thumbs.style.display = s.thumbs.length ? "" : "none";
+    if (logN !== s.events_total || s.state !== headKey) {
+      logN = s.events_total; headKey = s.state;
+      const atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 8;
+      log.replaceChildren(...s.events.map(e => el("div", { class: e.level }, el("span", { class: "t" }, `${fmt(e.t)}s `), `${e.kind}: ${e.msg}`)));
+      if (atEnd) log.scrollTop = log.scrollHeight;
+    }
+    const idq = encodeURIComponent(s.id);
+    links.replaceChildren(el("a", { href: `/api/sessions/${idq}/report`, target: "_blank" }, "report (JSON)"), el("a", { href: `/api/sessions/${idq}`, target: "_blank" }, "live stats (JSON)"), el("a", { href: `/api/sessions/${idq}/events`, target: "_blank" }, "events (JSON)"),
+      ...s.segments.map(g => el("a", { href: `/media/${idq}/${g.file}`, download: g.file }, `${g.file} (${(g.bytes / 1e6).toFixed(1)} MB${g.probe ? ", plays" : ""})`)), el("span", { class: "dim" }, s.id));
+  }
+  return { root, update, destroy() { destroyed = true; if (ws) ws.close(); if (vdec && vdec.state !== "closed") vdec.close(); api.stop(); } };
+}
+
+connectState();
+</script>
+</body>
+</html>
