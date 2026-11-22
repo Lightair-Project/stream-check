@@ -27,7 +27,7 @@ You need a Rust toolchain ([rustup.rs](https://rustup.rs)). ffmpeg is optional b
 on your `PATH` you get thumbnails, loudness (LUFS) and peak meters, and recordings are checked with ffprobe.
 
 ```sh
-git clone https://github.com/MoonGoblinDev/stream-check
+git clone https://github.com/Lightair-Project/stream-check
 cd stream-check
 cargo run --release
 ```
