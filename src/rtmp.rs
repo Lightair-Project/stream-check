@@ -70,82 +70,272 @@ struct ChunkStream {
     buf: Vec<u8>,
 }
 
-/// Turns FLV tag bodies into [`Media`].
+// Enhanced RTMP v2's connect flags ("Enhancing NetConnection connect Command")
+const CAPS_RECONNECT: u32 = 0x01;
+const CAPS_MULTITRACK: u32 = 0x02;
+const CAPS_MODEX: u32 = 0x04;
+const CAPS_NANO: u32 = 0x08;
+const CAN_DECODE: f64 = 1.0;
+
+/// The Enhanced RTMP fields of a `connect` command object, if it has any.
+fn enhanced_caps(f: &[(String, Amf)]) -> Option<serde_json::Value> {
+    let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+    let caps = get("capsEx").and_then(Amf::num);
+    let list = get("fourCcList").map(Amf::to_json);
+    let video = get("videoFourCcInfoMap").map(Amf::to_json);
+    let audio = get("audioFourCcInfoMap").map(Amf::to_json);
+    if caps.is_none() && list.is_none() && video.is_none() && audio.is_none() {
+        return None;
+    }
+    let bits = caps.unwrap_or(0.0) as u32;
+    Some(json!({
+        "caps_ex": caps,
+        "reconnect": bits & CAPS_RECONNECT != 0,
+        "multitrack": bits & CAPS_MULTITRACK != 0,
+        "mod_ex": bits & CAPS_MODEX != 0,
+        "timestamp_nano_offset": bits & CAPS_NANO != 0,
+        "four_cc_list": list,
+        "video_four_cc_info_map": video,
+        "audio_four_cc_info_map": audio,
+    }))
+}
+
+fn describe_caps(c: &serde_json::Value) -> String {
+    let flags: Vec<&str> = [("reconnect", "Reconnect"), ("multitrack", "Multitrack"), ("mod_ex", "ModEx"), ("timestamp_nano_offset", "TimestampNanoOffset")]
+        .iter()
+        .filter(|(k, _)| c[*k] == true)
+        .map(|(_, n)| *n)
+        .collect();
+    let mut out = format!("capsEx {} ({})", c["caps_ex"], if flags.is_empty() { "none".to_string() } else { flags.join(", ") });
+    for (k, n) in [("four_cc_list", "fourCcList"), ("video_four_cc_info_map", "videoFourCcInfoMap"), ("audio_four_cc_info_map", "audioFourCcInfoMap")] {
+        if !c[k].is_null() {
+            out.push_str(&format!(", {n} {}", c[k]));
+        }
+    }
+    out
+}
+
+/// The query of a published stream name: its parameter names and whether `clientConfigId` is
+/// among them. Values are never kept (a key or a config id is the sender's secret).
+fn key_query(full: &str) -> Option<serde_json::Value> {
+    let (_, q) = full.split_once('?')?;
+    let params: Vec<String> = q.split('&').filter(|p| !p.is_empty()).map(|p| p.split('=').next().unwrap_or("").to_string()).collect();
+    let cc = params.iter().any(|p| p == "clientConfigId");
+    Some(json!({ "params": params, "client_config_id": cc }))
+}
+
+/// What one video track has said about itself (its codec and NAL length size).
+#[derive(Clone, Copy)]
+struct VideoTrackState {
+    codec: VCodec,
+    nal_size: usize,
+}
+
+/// Turns FLV tag bodies into [`Media`]: classic tags, and Enhanced RTMP v2's extended video and
+/// audio (ModEx, command frames, metadata, and multitrack in all three layouts). Track 0 comes
+/// out as plain media; every other track as [`Media::Track`].
 #[derive(Default)]
 pub struct FlvDemux {
-    nal_size: usize,
-    video_codec: Option<VCodec>,
+    video_tracks: std::collections::HashMap<u8, VideoTrackState>,
     warned: Vec<String>,
+}
+
+/// The tracks a multitrack tag may carry that the lab keeps apart (more are ignored, once said).
+const MAX_TRACKS: u8 = 16;
+
+fn u16_at(d: &[u8], i: usize) -> Option<u16> {
+    Some(u16::from_be_bytes([*d.get(i)?, *d.get(i + 1)?]))
+}
+
+fn u24_at(d: &[u8], i: usize) -> Option<u32> {
+    Some(u32::from_be_bytes([0, *d.get(i)?, *d.get(i + 1)?, *d.get(i + 2)?]))
+}
+
+fn i24_at(d: &[u8], i: usize) -> Option<i32> {
+    u24_at(d, i).map(|v| ((v << 8) as i32) >> 8)
+}
+
+/// Skips Enhanced RTMP's ModEx entries: (the packet type after them, where the body starts, the
+/// nanosecond timestamp offset if one was given).
+fn mod_ex(d: &[u8], mut pt: u8, mut i: usize) -> Option<(u8, usize, u32)> {
+    let mut nano = 0;
+    while pt == 7 {
+        let mut size = *d.get(i)? as usize + 1;
+        i += 1;
+        if size == 256 {
+            size = u16_at(d, i)? as usize + 1;
+            i += 2;
+        }
+        let data = d.get(i..i + size)?;
+        i += size;
+        let b = *d.get(i)?;
+        i += 1;
+        // TimestampOffsetNano (0): at least 3 bytes, a UI24 of nanoseconds
+        if b >> 4 == 0 && data.len() >= 3 {
+            nano = u24_at(data, 0)?;
+        }
+        pt = b & 0x0f;
+    }
+    Some((pt, i, nano))
+}
+
+/// The tracks of a multitrack body. The FourCC is read once before the tracks, unless each track
+/// names its own (ManyTracksManyCodecs, layout 2); OneTrack (0) has no track sizes.
+/// One track of a multitrack message: its id, its FourCC, its body.
+type TrackPart<'a> = (u8, &'a [u8], &'a [u8]);
+
+fn tracks(d: &[u8], mut i: usize, layout: u8) -> Option<Vec<TrackPart<'_>>> {
+    let mut out = vec![];
+    let shared = if layout != 2 {
+        let f = d.get(i..i + 4)?;
+        i += 4;
+        Some(f)
+    } else {
+        None
+    };
+    while i < d.len() {
+        let fourcc = match shared {
+            Some(f) => f,
+            None => {
+                let f = d.get(i..i + 4)?;
+                i += 4;
+                f
+            }
+        };
+        let track = *d.get(i)?;
+        i += 1;
+        if layout == 0 {
+            // OneTrack: the rest of the message is the track's
+            out.push((track, fourcc, d.get(i..)?));
+            break;
+        }
+        let size = u24_at(d, i)? as usize;
+        i += 3;
+        out.push((track, fourcc, d.get(i..i + size)?));
+        i += size;
+    }
+    Some(out)
 }
 
 impl FlvDemux {
     pub fn new() -> Self {
-        FlvDemux { nal_size: 4, ..Default::default() }
+        FlvDemux::default()
+    }
+
+    fn say(&mut self, what: String, warn: &mut Vec<String>) {
+        if !self.warned.contains(&what) {
+            warn.push(what.clone());
+            self.warned.push(what);
+        }
+    }
+
+    fn push(track: u8, m: Media, out: &mut Vec<Media>) {
+        out.push(if track == 0 { m } else { Media::Track(track, Box::new(m)) });
     }
 
     /// The video tag body; says what it couldn't handle through `warn`.
     pub fn video(&mut self, ts: u32, d: &[u8], out: &mut Vec<Media>, warn: &mut Vec<String>) {
-        let mut unsupported = |what: String, warned: &mut Vec<String>| {
-            if !warned.contains(&what) {
-                warn.push(format!("the video {what} isn't supported by the lab (H.264 and HEVC are)"));
-                warned.push(what);
-            }
-        };
-        let i24 = |b: &[u8]| (((b[0] as i32) << 16 | (b[1] as i32) << 8 | b[2] as i32) << 8) >> 8;
-        if d.len() < 5 {
+        if d.is_empty() {
             return;
         }
-        if d[0] & 0x80 != 0 {
-            // Enhanced RTMP: packet type, frame type, FourCC
-            let (pt, ft) = (d[0] & 0x0f, (d[0] >> 4) & 7);
-            let codec = match &d[1..5] {
-                b"hvc1" => VCodec::Hevc,
-                b"avc1" => VCodec::H264,
-                other => return unsupported(format!("codec '{}'", String::from_utf8_lossy(other)), &mut self.warned),
+        if d[0] & 0x80 == 0 {
+            // the classic tag: frame type, codec id, then AVC packet type and composition time
+            if d.len() < 5 {
+                return;
+            }
+            let ft = d[0] >> 4;
+            let codec = match d[0] & 0x0f {
+                7 => VCodec::H264,
+                12 => VCodec::Hevc,
+                other => {
+                    return self.say(format!("the video codec id {other} isn't supported by the lab (H.264 and HEVC are)"), warn);
+                }
             };
-            match pt {
-                0 => self.config(codec, &d[5..], out),
-                1 if d.len() >= 8 => self.frame(codec, ts, i24(&d[5..8]), ft, &d[8..], out),
-                3 => self.frame(codec, ts, 0, ft, &d[5..], out),
+            match d[1] {
+                0 => self.config(0, codec, &d[5..], out),
+                1 => self.frame(0, codec, ts, i24_at(d, 2).unwrap_or(0), 0, ft, &d[5..], out),
                 _ => {}
             }
             return;
         }
-        // the classic tag: frame type, codec id, then AVC packet type and composition time
-        let ft = d[0] >> 4;
-        let codec = match d[0] & 0x0f {
-            7 => VCodec::H264,
-            12 => VCodec::Hevc,
-            other => return unsupported(format!("codec id {other}"), &mut self.warned),
+        // Enhanced RTMP: ExHeader flag, frame type (3 bits), packet type (4 bits)
+        let ft = (d[0] >> 4) & 7;
+        let Some((pt, i, nano)) = mod_ex(d, d[0] & 0x0f, 1) else {
+            return self.say("a video ModEx entry the lab couldn't read".into(), warn);
         };
-        match d[1] {
-            0 => self.config(codec, &d[5..], out),
-            1 => self.frame(codec, ts, i24(&d[2..5]), ft, &d[5..], out),
+        // a command frame (seek start or end) carries no picture; Metadata is colour info
+        if ft == 5 || pt == 4 {
+            return;
+        }
+        if pt == 6 {
+            let Some(&b) = d.get(i) else { return };
+            let (layout, inner) = (b >> 4, b & 0x0f);
+            if layout > 2 || inner == 6 {
+                return self.say(format!("a video multitrack layout the lab doesn't know ({layout}, packet type {inner})"), warn);
+            }
+            let Some(list) = tracks(d, i + 1, layout) else {
+                return self.say("a video multitrack message the lab couldn't read to its end".into(), warn);
+            };
+            for (track, fourcc, body) in list {
+                if track >= MAX_TRACKS {
+                    self.say(format!("video track {track}: the lab keeps tracks 0 to {}", MAX_TRACKS - 1), warn);
+                    continue;
+                }
+                self.video_track(track, fourcc, ft, inner, ts, nano, body, out, warn);
+            }
+            return;
+        }
+        let Some(fourcc) = d.get(i..i + 4) else { return };
+        self.video_track(0, fourcc, ft, pt, ts, nano, &d[i + 4..], out, warn);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn video_track(&mut self, track: u8, fourcc: &[u8], ft: u8, pt: u8, ts: u32, nano: u32, body: &[u8], out: &mut Vec<Media>, warn: &mut Vec<String>) {
+        let codec = match fourcc {
+            b"avc1" => VCodec::H264,
+            b"hvc1" => VCodec::Hevc,
+            other => {
+                return self.say(
+                    format!("the video codec '{}' isn't supported by the lab (H.264 and HEVC are)", String::from_utf8_lossy(other)),
+                    warn,
+                );
+            }
+        };
+        match pt {
+            0 => self.config(track, codec, body, out),
+            1 if body.len() >= 3 => self.frame(track, codec, ts, i24_at(body, 0).unwrap_or(0), nano, ft, &body[3..], out),
+            3 => self.frame(track, codec, ts, 0, nano, ft, body, out),
             _ => {}
         }
     }
 
-    fn config(&mut self, codec: VCodec, record: &[u8], out: &mut Vec<Media>) {
-        self.video_codec = Some(codec);
-        self.nal_size = match codec {
+    fn config(&mut self, track: u8, codec: VCodec, record: &[u8], out: &mut Vec<Media>) {
+        let nal_size = match codec {
             VCodec::H264 => record.get(4).map_or(4, |b| (b & 3) as usize + 1),
             VCodec::Hevc => record.get(21).map_or(4, |b| (b & 3) as usize + 1),
         };
-        out.push(Media::VideoConfig { codec, record: Arc::new(record.to_vec()) });
+        self.video_tracks.insert(track, VideoTrackState { codec, nal_size });
+        Self::push(track, Media::VideoConfig { codec, record: Arc::new(record.to_vec()) }, out);
     }
 
-    fn frame(&mut self, codec: VCodec, ts: u32, cts: i32, frame_type: u8, data: &[u8], out: &mut Vec<Media>) {
-        if self.video_codec != Some(codec) || data.is_empty() {
+    #[allow(clippy::too_many_arguments)]
+    fn frame(&mut self, track: u8, codec: VCodec, ts: u32, cts: i32, nano: u32, frame_type: u8, data: &[u8], out: &mut Vec<Media>) {
+        let Some(state) = self.video_tracks.get(&track).copied() else { return };
+        if state.codec != codec || data.is_empty() {
             return;
         }
-        let data = if self.nal_size == 4 {
+        let data = if state.nal_size == 4 {
             data.to_vec()
         } else {
-            let nals = nal::split_lengths(data, self.nal_size);
+            let nals = nal::split_lengths(data, state.nal_size);
             nal::to_lengths(&nals)
         };
-        let dts = ts as i64 * 1000;
-        out.push(Media::Video { pts_us: dts + cts as i64 * 1000, dts_us: dts, key: frame_type == 1, data: Arc::new(data) });
+        let dts = ts as i64 * 1000 + nano as i64 / 1000;
+        Self::push(
+            track,
+            Media::Video { pts_us: dts + cts as i64 * 1000, dts_us: dts, key: frame_type == 1, data: Arc::new(data) },
+            out,
+        );
     }
 
     pub fn audio(&mut self, ts: u32, d: &[u8], out: &mut Vec<Media>, warn: &mut Vec<String>) {
@@ -154,29 +344,56 @@ impl FlvDemux {
         }
         let format = d[0] >> 4;
         match format {
-            10 => match d[1] {
-                0 => {
-                    let (rate, ch, _) = crate::media::read_asc(&d[2..]).unwrap_or((44100, 2, 2));
-                    out.push(Media::AudioConfig { codec: ACodec::Aac, config: Arc::new(d[2..].to_vec()), sample_rate: rate, channels: ch });
+            10 => self.audio_track(0, b"mp4a", d[1], ts, 0, &d[2..], out, warn),
+            9 => {
+                // Enhanced RTMP: the packet type in the low nibble, ModEx, then one or many tracks
+                let Some((pt, i, nano)) = mod_ex(d, d[0] & 0x0f, 1) else {
+                    return self.say("an audio ModEx entry the lab couldn't read".into(), warn);
+                };
+                if pt == 5 {
+                    let Some(&b) = d.get(i) else { return };
+                    let (layout, inner) = (b >> 4, b & 0x0f);
+                    if layout > 2 || inner == 5 {
+                        return self.say(format!("an audio multitrack layout the lab doesn't know ({layout}, packet type {inner})"), warn);
+                    }
+                    let Some(list) = tracks(d, i + 1, layout) else {
+                        return self.say("an audio multitrack message the lab couldn't read to its end".into(), warn);
+                    };
+                    for (track, fourcc, body) in list {
+                        if track < MAX_TRACKS {
+                            self.audio_track(track, fourcc, inner, ts, nano, body, out, warn);
+                        }
+                    }
+                    return;
                 }
-                1 => out.push(Media::Audio { pts_us: ts as i64 * 1000, data: Arc::new(d[2..].to_vec()) }),
-                _ => {}
-            },
-            9 if d.len() >= 5 && &d[1..5] == b"Opus" => match d[0] & 0x0f {
-                0 => {
-                    let ch = d.get(5 + 9).copied().unwrap_or(2);
-                    out.push(Media::AudioConfig { codec: ACodec::Opus, config: Arc::new(vec![]), sample_rate: 48000, channels: ch });
-                }
-                1 => out.push(Media::Audio { pts_us: ts as i64 * 1000, data: Arc::new(d[5..].to_vec()) }),
-                _ => {}
-            },
-            other => {
-                let name = format!("audio format {other}");
-                if !self.warned.contains(&name) {
-                    warn.push(format!("the {name} isn't supported by the lab (AAC and Opus are)"));
-                    self.warned.push(name);
-                }
+                let Some(fourcc) = d.get(i..i + 4) else { return };
+                self.audio_track(0, fourcc, pt, ts, nano, &d[i + 4..], out, warn);
             }
+            other => self.say(format!("the audio format {other} isn't supported by the lab (AAC and Opus are)"), warn),
+        }
+    }
+
+    /// One audio track's packet: SequenceStart (0) or CodedFrames (1); the rest is skipped.
+    #[allow(clippy::too_many_arguments)]
+    fn audio_track(&mut self, track: u8, fourcc: &[u8], pt: u8, ts: u32, nano: u32, body: &[u8], out: &mut Vec<Media>, warn: &mut Vec<String>) {
+        let pts_us = ts as i64 * 1000 + nano as i64 / 1000;
+        match (fourcc, pt) {
+            (b"mp4a", 0) => {
+                let (rate, ch, _) = crate::media::read_asc(body).unwrap_or((44100, 2, 2));
+                let m = Media::AudioConfig { codec: ACodec::Aac, config: Arc::new(body.to_vec()), sample_rate: rate, channels: ch };
+                Self::push(track, m, out);
+            }
+            (b"Opus", 0) => {
+                // the Opus ID header: the channel count is its 10th byte
+                let ch = body.get(9).copied().unwrap_or(2);
+                Self::push(track, Media::AudioConfig { codec: ACodec::Opus, config: Arc::new(vec![]), sample_rate: 48000, channels: ch }, out);
+            }
+            (b"mp4a" | b"Opus", 1) => Self::push(track, Media::Audio { pts_us, data: Arc::new(body.to_vec()) }, out),
+            (b"mp4a" | b"Opus", _) => {}
+            (other, _) => self.say(
+                format!("the audio codec '{}' isn't supported by the lab (AAC and Opus are)", String::from_utf8_lossy(other)),
+                warn,
+            ),
         }
     }
 }
@@ -271,6 +488,8 @@ where
     let mut in_chunk = 128usize;
     let mut streams: std::collections::HashMap<u32, ChunkStream> = Default::default();
     let mut app = String::new();
+    // the client's Enhanced RTMP capabilities from `connect`, told to the session once it publishes
+    let mut client_caps: Option<serde_json::Value> = None;
     let mut publisher: Option<Publisher> = None;
     let mut demux = FlvDemux::new();
     let mut total: u64 = 0;
@@ -431,6 +650,7 @@ where
                     "connect" => {
                         if let Some(Amf::Object(f)) = vals.get(2) {
                             app = f.iter().find(|(k, _)| k == "app").and_then(|(_, v)| v.str()).unwrap_or("").to_string();
+                            client_caps = enhanced_caps(f);
                         }
                         let mut res = c.control(5, &2_500_000u32.to_be_bytes()).await;
                         if res.is_ok() {
@@ -450,7 +670,20 @@ where
                                     &[
                                         s("_result"),
                                         Amf::Number(txn),
-                                        obj(&[("fmsVer", s("FMS/3,0,1,123")), ("capabilities", Amf::Number(31.0))]),
+                                        // Enhanced RTMP v2: multitrack and ModEx, and the codecs the lab reads
+                                        obj(&[
+                                            ("fmsVer", s("FMS/3,0,1,123")),
+                                            ("capabilities", Amf::Number(31.0)),
+                                            ("capsEx", Amf::Number((CAPS_MULTITRACK | CAPS_MODEX) as f64)),
+                                            (
+                                                "videoFourCcInfoMap",
+                                                obj(&[("avc1", Amf::Number(CAN_DECODE)), ("hvc1", Amf::Number(CAN_DECODE))]),
+                                            ),
+                                            (
+                                                "audioFourCcInfoMap",
+                                                obj(&[("mp4a", Amf::Number(CAN_DECODE)), ("Opus", Amf::Number(CAN_DECODE))]),
+                                            ),
+                                        ]),
                                         obj(&[
                                             ("level", s("status")),
                                             ("code", s("NetConnection.Connect.Success")),
@@ -478,6 +711,17 @@ where
                             match hub.authorize(proto, &platform, &key, remote) {
                                 Ok(p) => {
                                     p.session.event(Level::Info, "rtmp", format!("publish app '{app}' key '{key}'"));
+                                    // the key's query (Twitch Dual Format's clientConfigId): names only
+                                    let query = key_query(&full);
+                                    if let Some(q) = &query {
+                                        let names: Vec<&str> = q["params"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).collect();
+                                        let cc = if q["client_config_id"] == true { "clientConfigId is there" } else { "no clientConfigId" };
+                                        p.session.event(Level::Info, "key-query", format!("the key has a query: {} ({cc})", names.join(", ")));
+                                    }
+                                    if let Some(c) = &client_caps {
+                                        p.session.event(Level::Info, "enhanced-rtmp", format!("the sender's Enhanced RTMP capabilities: {}", describe_caps(c)));
+                                    }
+                                    p.session.set_client(json!({ "enhanced_rtmp": client_caps, "key_query": query }));
                                     publisher = Some(p);
                                     let r = c.control(4, &[0, 0, 0, 0, 0, 1]).await;
                                     if r.is_ok() {

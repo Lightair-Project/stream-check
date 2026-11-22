@@ -254,7 +254,7 @@ impl Pipeline {
                     self.write_media(m);
                 }
             }
-            Media::Metadata(_) => {}
+            Media::Metadata(_) | Media::Track(..) => {}
         }
         note
     }
@@ -312,6 +312,12 @@ pub struct Inner {
     segment_no: u32,
     finalizing: bool,
     last_rtp_event: Option<Instant>,
+    /// Enhanced RTMP multitrack: the tracks beyond the first.
+    pub tracks: crate::tracks::Tracks,
+    /// What the sender said about itself: its Enhanced RTMP capabilities and its key's query.
+    pub client: Value,
+    /// The latest onMetaData, when it carried track maps.
+    pub track_maps: Value,
 }
 
 pub struct Session {
@@ -338,6 +344,8 @@ pub struct Hub {
     next_conn: AtomicU64,
     handle: tokio::runtime::Handle,
     pub addresses: Mutex<Value>,
+    /// The RTMP and RTMPS ports actually bound (GetClientConfiguration points a client at them).
+    pub ingest_ports: Mutex<(u16, Option<u16>)>,
 }
 
 pub fn now_ms() -> u64 {
@@ -465,6 +473,7 @@ impl Hub {
             next_conn: AtomicU64::new(1),
             handle: tokio::runtime::Handle::current(),
             addresses: Mutex::new(json!({})),
+            ingest_ports: Mutex::new((1935, None)),
         });
         hub.load_old_reports();
         let ticker = hub.clone();
@@ -616,6 +625,7 @@ impl Hub {
                 g.reconnects += 1;
                 g.grace_uses += 1;
                 g.analyzer.restarted();
+                g.tracks.restarted();
                 drop(g);
                 s.event(
                     Level::Info,
@@ -736,6 +746,9 @@ impl Hub {
                 segment_no: 0,
                 finalizing: false,
                 last_rtp_event: None,
+                tracks: Default::default(),
+                client: Value::Null,
+                track_maps: Value::Null,
             }),
             preview: broadcast::channel(256).0,
         });
@@ -757,8 +770,13 @@ impl Hub {
                 c.end_reason = Some(reason.clone());
             }
             let seg = g.pipeline.finish();
-            if let (Some((bytes, _)), Some(last)) = (seg, g.segments.iter_mut().rev().find(|x| x.connection == conn)) {
+            if let (Some((bytes, _)), Some(last)) = (seg, g.segments.iter_mut().rev().find(|x| x.connection == conn && !x.file.contains("-track"))) {
                 last.bytes = bytes;
+            }
+            for (file, bytes) in g.tracks.finish() {
+                if let Some(x) = g.segments.iter_mut().find(|x| x.file == file) {
+                    x.bytes = bytes;
+                }
             }
             let grace = self.grace_s(s.profile);
             g.last_gone = Some(Instant::now());
@@ -804,8 +822,13 @@ impl Hub {
             g.end_reason = Some(reason.clone());
             if g.conn.take().is_some() {
                 let seg = g.pipeline.finish();
-                if let (Some((bytes, _)), Some(last)) = (seg, g.segments.last_mut()) {
+                if let (Some((bytes, _)), Some(last)) = (seg, g.segments.iter_mut().rev().find(|x| !x.file.contains("-track"))) {
                     last.bytes = bytes;
+                }
+                for (file, bytes) in g.tracks.finish() {
+                    if let Some(x) = g.segments.iter_mut().find(|x| x.file == file) {
+                        x.bytes = bytes;
+                    }
                 }
             }
         }
@@ -922,6 +945,11 @@ impl Session {
         }
     }
 
+    /// What the sender said about itself (Enhanced RTMP capabilities, its key's query).
+    pub fn set_client(&self, v: Value) {
+        self.inner.lock().client = v;
+    }
+
     pub fn set_levels(&self, l: Levels) {
         let mut g = self.inner.lock();
         let notes = g.analyzer.set_levels(l, Instant::now());
@@ -976,8 +1004,29 @@ impl Session {
         if g.conn.map(|c| c.0) != Some(conn) {
             return;
         }
+        // a track beyond the first (Enhanced RTMP multitrack): analysed and recorded on its own
+        let m = match m {
+            Media::Track(id, inner) => {
+                let seg = g.segment_no;
+                let (notes, started) = g.tracks.feed(id, *inner, now, self.t0, &self.dir, seg);
+                self.push_notes(&mut g, notes);
+                if let Some(file) = started {
+                    let started_s = now.duration_since(self.t0).as_secs_f64();
+                    g.segments.push(SegmentInfo { file, container: "mkv", connection: conn, bytes: 0, started_s, probe: None });
+                }
+                return;
+            }
+            other => other,
+        };
+        g.tracks.on_track0(&m);
         if let Media::Metadata(v) = &m {
             self.push_event(&mut g, Level::Info, "metadata", format!("the sender's own description: {v}"));
+            // Enhanced RTMP's per-track descriptions (trackId 1 and up; 0 is the fields above)
+            let maps = json!({ "video": v.get("videoTrackIdInfoMap"), "audio": v.get("audioTrackIdInfoMap") });
+            if !maps["video"].is_null() || !maps["audio"].is_null() {
+                self.push_event(&mut g, Level::Info, "metadata-tracks", format!("track maps: video {}, audio {}", maps["video"], maps["audio"]));
+                g.track_maps = maps;
+            }
         }
         let notes = g.analyzer.on_media(&m, now);
         self.push_notes(&mut g, notes);
@@ -1029,8 +1078,12 @@ impl Session {
         if g.state == State::Live {
             let notes = g.analyzer.tick(now);
             self.push_notes(&mut g, notes);
+            let fps0 = g.analyzer.stats.video.fps;
+            let notes = g.tracks.tick(now, fps0);
+            self.push_notes(&mut g, notes);
             let seconds = now.duration_since(self.t0).as_secs_f64();
-            let found = profiles::check(self.profile, &g.analyzer.stats, seconds);
+            let mut found = profiles::check(self.profile, &g.analyzer.stats, seconds);
+            found.extend(profiles::check_tracks(self.profile, &g.analyzer.stats, &g.tracks.stats(), seconds));
             let t = seconds;
             let mut active: HashSet<String> = HashSet::new();
             for v in found {
@@ -1085,9 +1138,14 @@ impl Session {
         let mut segments = g.segments.clone();
         if g.conn.is_some() {
             if let (Some(last), Some(n)) =
-                (segments.last_mut(), g.pipeline.raw.as_ref().map(|r| r.1).or(g.pipeline.file.as_ref().map(|f| f.1)))
+                (segments.iter_mut().rev().find(|x| !x.file.contains("-track")), g.pipeline.raw.as_ref().map(|r| r.1).or(g.pipeline.file.as_ref().map(|f| f.1)))
             {
                 last.bytes = n;
+            }
+            for (file, n) in g.tracks.recording_bytes() {
+                if let Some(x) = segments.iter_mut().find(|x| x.file == file) {
+                    x.bytes = n;
+                }
             }
         }
         let mut v = json!({
@@ -1108,6 +1166,9 @@ impl Session {
             "grace_s": self.profile.grace_s,
             "grace_left_s": g.grace_until.map(|u| u.saturating_duration_since(now).as_secs_f64()),
             "stats": g.analyzer.stats,
+            "tracks": g.tracks.summary(&g.analyzer.stats),
+            "client": g.client,
+            "track_maps": g.track_maps,
             "violations": g.violations,
             "events_total": g.events.len(),
             "faults": self.slot.faults.lock().describe(now),
@@ -1165,6 +1226,7 @@ impl Session {
         if !st.has_video && !st.has_audio {
             problems.push("no media ever arrived".into());
         }
+        problems.extend(g.tracks.problems());
         for s in &g.segments {
             if s.bytes > 0 && s.probe.is_none() && self.dir.join(&s.file).exists() && crate::helper::ffmpeg_available() {
                 problems.push(format!("{} doesn't play (ffprobe could not read it)", s.file));
@@ -1189,6 +1251,9 @@ impl Session {
             "grace_uses": g.grace_uses,
             "profile": self.profile,
             "stats": st,
+            "tracks": g.tracks.summary(st),
+            "client": g.client,
+            "track_maps": g.track_maps,
             "violations": g.violations,
             "segments": g.segments,
             "thumbs": thumbs,
@@ -1241,7 +1306,7 @@ fn preview_message(m: &Media, a: &Analyzer) -> Option<Vec<u8>> {
             out.extend(pts_us.to_be_bytes());
             out.extend(data.iter());
         }
-        Media::Metadata(_) => return None,
+        Media::Metadata(_) | Media::Track(..) => return None,
     }
     Some(out)
 }

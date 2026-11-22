@@ -8,6 +8,8 @@ pub enum Amf {
     Bool(bool),
     Str(String),
     Object(Vec<(String, Amf)>),
+    /// A strict array (Enhanced RTMP's `fourCcList`).
+    Array(Vec<Amf>),
     Null,
 }
 
@@ -25,6 +27,7 @@ impl Amf {
             Amf::Str(s) => json!(s),
             Amf::Null => Value::Null,
             Amf::Object(f) => Value::Object(f.iter().map(|(k, v)| (k.clone(), v.to_json())).collect::<Map<_, _>>()),
+            Amf::Array(a) => Value::Array(a.iter().map(Amf::to_json).collect()),
         }
     }
 }
@@ -49,6 +52,13 @@ pub fn write(out: &mut Vec<u8>, v: &Amf) {
                 write(out, v);
             }
             out.extend([0, 0, 9]);
+        }
+        Amf::Array(items) => {
+            out.push(10);
+            out.extend((items.len() as u32).to_be_bytes());
+            for v in items {
+                write(out, v);
+            }
         }
         Amf::Null => out.push(5),
     }
@@ -111,10 +121,11 @@ pub fn read(b: &mut &[u8]) -> Option<Amf> {
         }
         10 => {
             let n = u32::from_be_bytes(take(b, 4)?.try_into().ok()?);
+            let mut items = vec![];
             for _ in 0..n {
-                read(b)?;
+                items.push(read(b)?);
             }
-            Amf::Null
+            Amf::Array(items)
         }
         11 => {
             take(b, 10)?;

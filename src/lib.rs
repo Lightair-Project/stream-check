@@ -17,5 +17,6 @@ pub mod rtmp;
 pub mod rtp;
 pub mod srt;
 pub mod tls;
+pub mod tracks;
 pub mod ts;
 pub mod whip;

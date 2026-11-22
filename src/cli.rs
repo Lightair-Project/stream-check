@@ -44,7 +44,8 @@ OPTIONS FOR THE OTHER COMMANDS
   --data <dir>           where to read reports from when it isn't running
 
 Platforms are the first part of the path: rtmp://host:1935/twitch/<key>, srt://host:9000?streamid=twitch/<key>,
-http://host:8890/whip/twitch/<key>. twitch, youtube, kick and open are known; anything else is 'open'.
+http://host:8890/whip/twitch/<key>. twitch, twitch-dual (Twitch Dual Format: Enhanced RTMP multitrack), youtube, kick and open are known;
+anything else is 'open'.
 ";
 
 pub fn serve_config(args: &[String]) -> Result<Config, String> {
@@ -67,14 +68,16 @@ pub fn serve_config(args: &[String]) -> Result<Config, String> {
         |v: Option<&String>, name: &str| -> Result<u32, String> { v.and_then(|v| v.parse().ok()).ok_or(format!("{name} needs a number")) };
     while i < args.len() {
         let v = args.get(i + 1);
+        // an option and its value, or a word alone
+        let mut step = 2;
         match args[i].as_str() {
-            "serve" => {}
+            "serve" => step = 1,
             "--http-port" => cfg.http_port = num(v, "--http-port")? as u16,
             "--rtmp-port" => cfg.rtmp_port = num(v, "--rtmp-port")? as u16,
             "--rtmps-port" => cfg.rtmps_port = Some(num(v, "--rtmps-port")? as u16),
             "--no-rtmps" => {
                 cfg.rtmps_port = None;
-                i -= 1;
+                step = 1;
             }
             "--srt-port" => cfg.srt_port = num(v, "--srt-port")? as u16,
             "--srt-passphrase" => cfg.srt_passphrase = Some(v.cloned().ok_or("--srt-passphrase needs a value")?),
@@ -82,11 +85,11 @@ pub fn serve_config(args: &[String]) -> Result<Config, String> {
             "--data" => cfg.data_dir = PathBuf::from(v.ok_or("--data needs a folder")?),
             "--strict-keys" => {
                 cfg.lenient_keys = false;
-                i -= 1;
+                step = 1;
             }
             "--any-key" => {
                 cfg.lenient_keys = true;
-                i -= 1;
+                step = 1;
             }
             "--accept-key" => {
                 let (p, k) = v.and_then(|v| v.split_once('=')).ok_or("--accept-key needs platform=key")?;
@@ -96,7 +99,7 @@ pub fn serve_config(args: &[String]) -> Result<Config, String> {
             "--keep" => cfg.keep_recordings = num(v, "--keep")? as usize,
             other => return Err(format!("unknown option '{other}'\n\n{USAGE}")),
         }
-        i += 2;
+        i += step;
     }
     if let Some(p) = &cfg.srt_passphrase {
         if !(10..=79).contains(&p.len()) {
@@ -222,6 +225,34 @@ pub fn summary_text(r: &Value) -> String {
         v["gaps"].as_u64().unwrap_or(0) + a["gaps"].as_u64().unwrap_or(0),
         v["dts_backwards"].as_u64().unwrap_or(0) + a["pts_backwards"].as_u64().unwrap_or(0),
     );
+    // Enhanced RTMP multitrack: the tracks beyond the first, and the total
+    for t in r["tracks"]["tracks"].as_array().into_iter().flatten() {
+        let tv = &t["video"];
+        if let Some(s) = tv["sps"].as_object() {
+            out += &format!(
+                "  track {} video {}x{}, {:.1} fps, {:.0} kbps, keyframe every {} s{}; keyframes aligned {}, not {}; starts {} ms from track 0\n",
+                t["track"],
+                s["width"],
+                s["height"],
+                tv["fps"].as_f64().unwrap_or(0.0),
+                tv["kbps"].as_f64().unwrap_or(0.0),
+                tv["keyint_avg_s"].as_f64().map_or("?".into(), |k| format!("{k:.2}")),
+                if tv["b_frames"] == true { ", B-frames" } else { "" },
+                t["keyframes_aligned"],
+                t["keyframes_misaligned"],
+                t["start_offset_ms"].as_f64().map_or("?".into(), |o| format!("{o:.0}")),
+            );
+        }
+        if t["has_audio"] == true {
+            out += &format!("  track {} audio {} {} Hz\n", t["track"], t["audio"]["codec"].as_str().unwrap_or("?").to_uppercase(), t["audio"]["sample_rate"]);
+        }
+    }
+    if let Some(total) = r["tracks"]["total_video_kbps"].as_f64() {
+        out += &format!("  tracks {}, picture {total:.0} kbps in all\n", r["tracks"]["count"]);
+    }
+    if r["client"]["key_query"]["client_config_id"] == true {
+        out += "  key query: clientConfigId is there\n";
+    }
     out += &format!("  reconnects {}, grace used {}\n", r["reconnects"], r["grace_uses"]);
     for p in r["violations"].as_array().into_iter().flatten() {
         out += &format!("  rule {} [{}x]: {}\n", p["rule"].as_str().unwrap_or("?"), p["count"], p["msg"].as_str().unwrap_or(""));

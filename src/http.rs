@@ -51,9 +51,62 @@ pub fn router(app: App) -> Router {
         .route("/media/{id}/{*file}", get(media))
         .route("/ws/state", get(ws_state))
         .route("/ws/preview/{id}", get(ws_preview))
+        .route("/api/v3/GetClientConfiguration", post(client_configuration))
         .route("/whip/session/{id}", delete(whip_delete).options(whip_options))
         .route("/whip/{*path}", post(whip_post).options(whip_options))
         .with_state(app)
+}
+
+/// Twitch's Enhanced Broadcasting configuration service, standing in: a fixed Dual Format plan
+/// (each of the client's two canvases as one track, 2 s keyframes, AAC) whose ingest is this
+/// lab, so a client's whole Dual Format path can be tried without Twitch. The field names follow
+/// OBS's reading of Twitch's answer; the values are the lab's, not Twitch's.
+async fn client_configuration(State(a): State<App>, headers: HeaderMap, body: String) -> Response {
+    let req: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let config_id = format!("stream-check-{:x}", crate::hub::now_ms());
+    let fail = |msg: &str| Json(json!({ "meta": { "config_id": config_id }, "status": { "result": "error", "html_en_us": msg } })).into_response();
+    if req.is_null() {
+        return fail("Stream Check: the request isn't JSON.");
+    }
+    if req["authentication"].as_str().is_none_or(str::is_empty) {
+        return fail("Stream Check: no stream key in <code>authentication</code>.");
+    }
+    let canvases = req["preferences"]["canvases"].as_array().cloned().unwrap_or_default();
+    if canvases.len() < 2 {
+        return fail("Stream Check: Dual Format needs two canvases (landscape and vertical).");
+    }
+    // the client's own encoder kind on its system (libobs encoder ids, as Twitch answers)
+    let apple = req["capabilities"]["system"]["name"].as_str() == Some("macOS");
+    let kind = if apple { "com.apple.videotoolbox.videoencoder.ave.avc" } else { "obs_x264" };
+    let track = |i: usize, c: &Value, kbps: u32| {
+        let (w, h) = (c["width"].as_u64().unwrap_or(1920).min(1920), c["height"].as_u64().unwrap_or(1080).min(1920));
+        let fr = if c["framerate"].is_object() { c["framerate"].clone() } else { json!({ "numerator": 30, "denominator": 1 }) };
+        json!({
+            "type": kind, "width": w, "height": h, "framerate": fr,
+            "gpu_scale_type": "OBS_SCALE_BICUBIC", "colorspace": "OBS_VIDEO_CS_709", "range": "OBS_VIDEO_RANGE_PARTIAL",
+            "format": "OBS_VIDEO_FORMAT_NV12", "bitrate_interpolation_points": null,
+            "settings": { "bitrate": kbps, "keyint_sec": 2, "rate_control": "CBR", "profile": "high", "bframes": 0 },
+            "canvas_index": i,
+        })
+    };
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(|h| h.rsplit_once(':').map_or(h, |(n, _)| n).to_string())
+        .unwrap_or_else(|| "127.0.0.1".into());
+    let (rtmp, rtmps) = *a.hub.ingest_ports.lock();
+    let mut endpoints = vec![json!({ "protocol": "RTMP", "url_template": format!("rtmp://{host}:{rtmp}/twitch-dual/{{stream_key}}") })];
+    if let Some(p) = rtmps {
+        endpoints.push(json!({ "protocol": "RTMPS", "url_template": format!("rtmps://{host}:{p}/twitch-dual/{{stream_key}}") }));
+    }
+    Json(json!({
+        "meta": { "config_id": config_id, "schema_version": req["schema_version"] },
+        "status": { "result": "success", "html_en_us": "Stream Check: a fixed Dual Format plan (two tracks), streaming to this lab." },
+        "ingest_endpoints": endpoints,
+        "encoder_configurations": [track(0, &canvases[0], 6000), track(1, &canvases[1], 5000)],
+        "audio_configurations": { "live": [{ "codec": "aac", "track_id": 1, "channels": 2, "settings": { "bitrate": 160 } }], "vod": null },
+    }))
+    .into_response()
 }
 
 async fn status(State(a): State<App>) -> Json<Value> {

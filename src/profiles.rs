@@ -27,6 +27,8 @@ pub struct Profile {
     pub grace_s: u32,
     /// What a good stream key looks like, for the message.
     pub key_hint: &'static str,
+    /// Twitch Dual Format's rules across an Enhanced RTMP multitrack stream's tracks.
+    pub dual_format: bool,
 }
 
 pub const PROFILES: &[Profile] = &[
@@ -45,6 +47,25 @@ pub const PROFILES: &[Profile] = &[
         audio_required: true,
         grace_s: 30,
         key_hint: "live_<digits>_<letters>",
+        dual_format: false,
+    },
+    Profile {
+        name: "twitch-dual",
+        label: "Twitch Dual Format",
+        video_codecs: &[VCodec::H264, VCodec::Hevc],
+        // the total across tracks is held against 12.5 Mbps instead (check_tracks)
+        max_video_kbps: None,
+        max_keyint_s: Some(2.0),
+        max_width: Some(1920),
+        max_height: Some(1080),
+        max_fps: Some(60.5),
+        audio_codecs: &[ACodec::Aac],
+        audio_rates: &[44100, 48000],
+        b_frames_ok: false,
+        audio_required: true,
+        grace_s: 30,
+        key_hint: "live_<digits>_<letters>?clientConfigId=<id>",
+        dual_format: true,
     },
     Profile {
         name: "youtube",
@@ -61,6 +82,7 @@ pub const PROFILES: &[Profile] = &[
         audio_required: true,
         grace_s: 10,
         key_hint: "xxxx-xxxx-xxxx-xxxx-xxxx",
+        dual_format: false,
     },
     Profile {
         name: "kick",
@@ -77,6 +99,7 @@ pub const PROFILES: &[Profile] = &[
         audio_required: true,
         grace_s: 15,
         key_hint: "sk_<region>_<letters>",
+        dual_format: false,
     },
     Profile {
         name: "open",
@@ -93,6 +116,7 @@ pub const PROFILES: &[Profile] = &[
         audio_required: false,
         grace_s: 10,
         key_hint: "anything",
+        dual_format: false,
     },
 ];
 
@@ -104,7 +128,7 @@ impl Profile {
     /// Whether this platform would take the key.
     pub fn key_ok(&self, key: &str) -> bool {
         match self.name {
-            "twitch" => key.starts_with("live_") && key.len() >= 12,
+            "twitch" | "twitch-dual" => key.starts_with("live_") && key.len() >= 12,
             "youtube" => {
                 let parts: Vec<&str> = key.split('-').collect();
                 parts.len() == 5 && parts.iter().all(|p| p.len() == 4 && p.chars().all(|c| c.is_ascii_alphanumeric()))
@@ -117,7 +141,7 @@ impl Profile {
     /// An example key that passes.
     pub fn example_key(&self) -> &'static str {
         match self.name {
-            "twitch" => "live_123456789_labtestkey",
+            "twitch" | "twitch-dual" => "live_123456789_labtestkey",
             "youtube" => "abcd-efgh-ijkl-mnop-qrst",
             "kick" => "sk_us-west-2_labtestkey",
             _ => "test",
@@ -174,6 +198,70 @@ pub fn check(p: &Profile, s: &Stats, seconds_live: f64) -> Vec<Violation> {
         }
     } else if p.audio_required && s.has_video && seconds_live > 5.0 {
         v("audio-missing", Level::Warn, format!("no audio after {seconds_live:.0} s; {} expects it", p.label));
+    }
+    out
+}
+
+/// Twitch Dual Format's own total: picture across every track.
+pub const DUAL_MAX_TOTAL_KBPS: f64 = 12_500.0;
+
+/// The rules across an Enhanced RTMP multitrack stream's tracks (`s0` is track 0's stats,
+/// `tracks` the others'): each track's keyframes, and for Twitch Dual Format a landscape and a
+/// vertical picture, the vertical at 1080x1920, track 0 the largest landscape one, the total
+/// against 12.5 Mbps.
+pub fn check_tracks(p: &Profile, s0: &Stats, tracks: &[(u8, &Stats)], seconds_live: f64) -> Vec<Violation> {
+    let mut out = vec![];
+    let mut v = |rule, level, msg: String| out.push(Violation { rule, level, msg });
+    if let Some(max) = p.max_keyint_s {
+        let worst = tracks
+            .iter()
+            .filter(|(_, s)| s.has_video)
+            .map(|(id, s)| (*id, s.video.since_key_s.unwrap_or(0.0).max(s.video.keyint_last_s.unwrap_or(0.0))))
+            .fold(None, |a: Option<(u8, f64)>, b| if a.is_none_or(|a| b.1 > a.1) { Some(b) } else { a });
+        if let Some((id, w)) = worst.filter(|w| w.1 > max + 0.25) {
+            v("track-keyframe-interval", Level::Error, format!("track {id}: a keyframe every {w:.1} s; {} wants one at least every {max:.0} s", p.label));
+        }
+    }
+    if !p.dual_format {
+        return out;
+    }
+    // every picture with its size, track 0 first
+    let sizes: Vec<(u8, u32, u32, f64)> = std::iter::once((0u8, s0))
+        .chain(tracks.iter().map(|(id, s)| (*id, *s)))
+        .filter_map(|(id, s)| s.video.sps.as_ref().map(|sps| (id, sps.width, sps.height, s.video.kbps)))
+        .collect();
+    if sizes.is_empty() || seconds_live < 5.0 {
+        return out;
+    }
+    let landscape: Vec<_> = sizes.iter().filter(|t| t.1 > t.2).collect();
+    let vertical: Vec<_> = sizes.iter().filter(|t| t.2 > t.1).collect();
+    if landscape.is_empty() || vertical.is_empty() {
+        v(
+            "dual-tracks",
+            Level::Error,
+            format!(
+                "{} wants a 16:9 and a 9:16 picture; this stream has {} landscape and {} vertical",
+                p.label,
+                landscape.len(),
+                vertical.len()
+            ),
+        );
+    }
+    if let Some(big) = vertical.iter().max_by_key(|t| t.1 as u64 * t.2 as u64) {
+        if (big.1, big.2) != (1080, 1920) {
+            v("dual-vertical-size", Level::Error, format!("the largest vertical track (track {}) is {}x{}; {} wants 1080x1920", big.0, big.1, big.2, p.label));
+        }
+    }
+    if let Some(big) = landscape.iter().max_by_key(|t| t.1 as u64 * t.2 as u64) {
+        if big.0 != 0 {
+            v("dual-track0", Level::Error, format!("track 0 should be the largest landscape picture; track {} ({}x{}) is larger", big.0, big.1, big.2));
+        }
+    } else if !vertical.is_empty() && sizes.first().is_some_and(|t| t.0 == 0 && t.2 > t.1) {
+        v("dual-track0", Level::Error, "track 0 is vertical; it should be the largest landscape picture".into());
+    }
+    let total: f64 = sizes.iter().map(|t| t.3).sum();
+    if total > DUAL_MAX_TOTAL_KBPS {
+        v("dual-bitrate", Level::Error, format!("{total:.0} kbps of picture across the tracks is over {}'s {DUAL_MAX_TOTAL_KBPS:.0}", p.label));
     }
     out
 }

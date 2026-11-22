@@ -326,7 +326,7 @@ impl Analyzer {
             }
             Media::Video { pts_us, dts_us, key, data } => self.on_video(*pts_us, *dts_us, *key, data, now, &mut out),
             Media::Audio { pts_us, data } => self.on_audio(*pts_us, data, now, &mut out),
-            Media::Metadata(_) => {}
+            Media::Metadata(_) | Media::Track(..) => {}
         }
         out
     }

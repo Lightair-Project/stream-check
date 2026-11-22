@@ -75,6 +75,7 @@ pub async fn start(cfg: Config) -> Result<Running, String> {
         let _ = axum::serve(http, router(app).into_make_service_with_connect_info::<SocketAddr>()).await;
     });
 
+    *hub.ingest_ports.lock() = (rtmp_addr.port(), rtmps_addr.map(|a| a.port()));
     *hub.addresses.lock() = addresses(
         &Ports { http: http_addr.port(), rtmp: rtmp_addr.port(), rtmps: rtmps_addr.map(|a| a.port()), srt: srt_port },
         cfg.srt_passphrase.as_deref(),

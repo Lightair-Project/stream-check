@@ -82,6 +82,7 @@ graphs, fault buttons, a thumbnail timeline and the event log.
 | Profile | Video | Bitrate | Keyframes | Audio | Grace |
 |---|---|---|---|---|---|
 | `twitch` | H.264, no B-frames | 8500 kbps | every 2 s | AAC 44.1/48 kHz | 30 s |
+| `twitch-dual` | Twitch Dual Format: H.264 (HEVC read), no B-frames, multitrack (below) | 12500 kbps across the tracks | every 2 s, every track | AAC 44.1/48 kHz | 30 s |
 | `youtube` | H.264, HEVC | 51000 kbps | every 4 s | AAC, Opus | 10 s |
 | `kick` | H.264, no B-frames | 8000 kbps | every 2 s | AAC 44.1/48 kHz | 15 s |
 | `open` | anything | no limit | any | anything | 10 s |
@@ -90,6 +91,41 @@ These are approximations of the platforms' published limits, for testing; they a
 platforms. A stream that disconnects stays a *session* for the grace period (shown as "waiting"); if the same
 key publishes again within it, the session continues (new recording segment, `reconnects` and `grace_uses`
 go up); otherwise the session ends and its report is written. `--grace <s>` overrides the profiles.
+
+## Enhanced RTMP multitrack and Twitch Dual Format
+
+Stream Check reads Enhanced RTMP v2 ([veovera/enhanced-rtmp](https://github.com/veovera/enhanced-rtmp)) as well
+as classic FLV tags:
+
+- **connect:** the client's `capsEx`, `fourCcList`, `videoFourCcInfoMap` and `audioFourCcInfoMap` are kept
+  (the report's `client.enhanced_rtmp`, and an event). The `_result` says the lab supports multitrack and ModEx
+  (`capsEx` 0x06) and decodes `avc1`, `hvc1`, `mp4a` and `Opus`.
+- **video:** extended headers with ModEx (TimestampOffsetNano), command frames and Metadata skipped, and
+  `Multitrack` in all three layouts (`OneTrack`, `ManyTracks`, `ManyTracksManyCodecs`), with SequenceStart,
+  CodedFrames, CodedFramesX and SequenceEnd in each track. A classic tag is track 0.
+- **audio:** the same with `Multitrack` audio; classic AAC is track 0.
+- **per track:** every track beyond the first is analysed on its own (codec, profile, size, frame rate,
+  bitrate average and peak, keyframe interval, B-frames, timestamps) and recorded as its own playable file,
+  `segNN-trackN.mkv`, beside the main recording. The report's `tracks` lists them, with `total_video_kbps`.
+- **across tracks:** each track's keyframes are held against track 0's (aligned within one frame of the slower
+  track), its start against track 0's (one timestamp base, within 1 s), and its timestamps must rise.
+- **the key:** the stream name's query is reported by parameter name only (`client.key_query`, and whether
+  `clientConfigId` is there); values are never kept.
+- **onMetaData:** `videoTrackIdInfoMap` and `audioTrackIdInfoMap` are kept when sent (`track_maps`).
+
+The `twitch-dual` profile (`rtmp://host:1935/twitch-dual/<key>`) adds Twitch Dual Format's rules: at least one
+16:9 and one 9:16 picture, the largest 9:16 one 1080x1920, track 0 the largest landscape one, every track's
+keyframes every 2 s, the picture's total against 12.5 Mbps, AAC sound.
+
+**A stand-in configuration service:** `POST /api/v3/GetClientConfiguration` on the HTTP port answers a fixed
+Dual Format plan for a request in OBS's form (two canvases, a stream key in `authentication`): each canvas as one
+track (6000 and 5000 kbps CBR, 2 s keyframes, no B-frames, VideoToolbox's encoder ids on macOS, x264's
+otherwise), AAC at 160 kbps, and an `ingest_endpoints` URL pointing at this lab's `twitch-dual`. The field names
+follow OBS's reading of Twitch's answer; the values are the lab's own, not Twitch's.
+
+**A test sender:** `tools/ertmp-send.py` publishes a two-picture FLV (as ffmpeg 8 writes one) in any of the three
+multitrack layouts, with ModEx, multitrack audio, track maps and a key query; its header says how. ffmpeg 8 itself
+sends the `OneTrack` layout libobs uses (`ffmpeg ... -map 0:v -map 1:v -map 2:a ... -f flv rtmp://...`).
 
 ## Fault injection
 

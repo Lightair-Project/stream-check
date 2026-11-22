@@ -34,6 +34,9 @@ pub enum Media {
     Audio { pts_us: i64, data: Arc<Vec<u8>> },
     /// The sender's own description of the stream (RTMP onMetaData).
     Metadata(serde_json::Value),
+    /// A track other than the first of an Enhanced RTMP multitrack stream (Twitch Dual Format's
+    /// vertical picture, say): its id and what it carried. Track 0 comes as plain media.
+    Track(u8, Box<Media>),
 }
 
 /// Turns Annex B pictures (MPEG-TS, RTP) into [`Media`]: parameter sets are collected into a
