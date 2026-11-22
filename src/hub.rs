@@ -2,7 +2,7 @@
 //! grace period continues its session), faults, recordings and reports. Ingests (RTMP, SRT, WHIP)
 //! call [`Hub::authorize`] and then feed the [`Publisher`] they get.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -318,7 +318,13 @@ pub struct Inner {
     pub client: Value,
     /// The latest onMetaData, when it carried track maps.
     pub track_maps: Value,
+    /// Each other track's preview start: its config, and its pictures since the last keyframe.
+    track_preview: BTreeMap<u8, PreviewStart>,
 }
+
+/// A preview's start for a new viewer: its config messages, and its pictures since the last
+/// keyframe.
+type PreviewStart = (Vec<Arc<Vec<u8>>>, Vec<Arc<Vec<u8>>>);
 
 pub struct Session {
     pub id: String,
@@ -332,6 +338,8 @@ pub struct Session {
     pub slot: Arc<Slot>,
     pub inner: Mutex<Inner>,
     pub preview: broadcast::Sender<Arc<Vec<u8>>>,
+    /// The other tracks' previews (Enhanced RTMP multitrack), each message with its track.
+    pub track_preview: broadcast::Sender<(u8, Arc<Vec<u8>>)>,
 }
 
 pub struct Hub {
@@ -749,8 +757,10 @@ impl Hub {
                 tracks: Default::default(),
                 client: Value::Null,
                 track_maps: Value::Null,
+                track_preview: BTreeMap::new(),
             }),
             preview: broadcast::channel(256).0,
+            track_preview: broadcast::channel(512).0,
         });
         self.sessions.lock().push(s.clone());
         s.event(Level::Info, "session", format!("new session {} on {} ({})", s.id, profile.label, profile.key_hint));
@@ -1008,7 +1018,32 @@ impl Session {
         let m = match m {
             Media::Track(id, inner) => {
                 let seg = g.segment_no;
+                let copy = (*inner).clone();
                 let (notes, started) = g.tracks.feed(id, *inner, now, self.t0, &self.dir, seg);
+                // the track's own preview, as the main one is made
+                let msg = g.tracks.list.get(&id).and_then(|t| preview_message(&copy, &t.analyzer)).map(Arc::new);
+                if let Some(msg) = msg {
+                    let (init, gop) = g.track_preview.entry(id).or_default();
+                    match &copy {
+                        Media::VideoConfig { .. } => {
+                            init.retain(|x| x[0] != 1);
+                            init.push(msg.clone());
+                            gop.clear();
+                        }
+                        Media::Video { key, .. } => {
+                            if *key {
+                                gop.clear();
+                            }
+                            if gop.len() < 600 {
+                                gop.push(msg.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                    if matches!(copy, Media::VideoConfig { .. } | Media::Video { .. }) {
+                        let _ = self.track_preview.send((id, msg));
+                    }
+                }
                 self.push_notes(&mut g, notes);
                 if let Some(file) = started {
                     let started_s = now.duration_since(self.t0).as_secs_f64();
@@ -1060,6 +1095,12 @@ impl Session {
     }
 
     /// What a new preview viewer needs first: the configs and the pictures since the last keyframe.
+    /// What a new viewer of track `id`'s preview gets first.
+    pub fn track_preview_start(&self, id: u8) -> Vec<Arc<Vec<u8>>> {
+        let g = self.inner.lock();
+        g.track_preview.get(&id).map_or(vec![], |(init, gop)| init.iter().chain(gop.iter()).cloned().collect())
+    }
+
     pub fn preview_start(&self) -> Vec<Arc<Vec<u8>>> {
         let g = self.inner.lock();
         g.preview_init.iter().chain(g.preview_gop.iter()).cloned().collect()

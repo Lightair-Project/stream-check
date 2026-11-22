@@ -276,12 +276,41 @@ async fn ws_state(State(a): State<App>, ws: WebSocketUpgrade) -> Response {
     })
 }
 
-async fn ws_preview(State(a): State<App>, Path(id): Path<String>, ws: WebSocketUpgrade) -> Response {
+#[derive(Deserialize)]
+struct PreviewQuery {
+    /// An Enhanced RTMP multitrack session's other track (0 or absent: the main picture and sound).
+    track: Option<u8>,
+}
+
+async fn ws_preview(State(a): State<App>, Path(id): Path<String>, Query(q): Query<PreviewQuery>, ws: WebSocketUpgrade) -> Response {
     let s = match find(&a, &id) {
         Ok(s) => s,
         Err(e) => return e,
     };
+    let track = q.track.filter(|t| *t > 0);
     ws.on_upgrade(move |mut socket: WebSocket| async move {
+        if let Some(t) = track {
+            let mut rx = s.track_preview.subscribe();
+            for m in s.track_preview_start(t) {
+                if socket.send(Message::Binary(m.to_vec().into())).await.is_err() {
+                    return;
+                }
+            }
+            loop {
+                tokio::select! {
+                    m = rx.recv() => match m {
+                        Ok((id, m)) => if id == t && socket.send(Message::Binary(m.to_vec().into())).await.is_err() { break },
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => break,
+                    },
+                    c = socket.recv() => if c.is_none() { break },
+                }
+                if s.inner.lock().state == SessionState::Ended {
+                    break;
+                }
+            }
+            return;
+        }
         let mut rx = s.preview.subscribe();
         for m in s.preview_start() {
             if socket.send(Message::Binary(m.to_vec().into())).await.is_err() {

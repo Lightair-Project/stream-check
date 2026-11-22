@@ -112,6 +112,8 @@ as classic FLV tags:
 - **the key:** the stream name's query is reported by parameter name only (`client.key_query`, and whether
   `clientConfigId` is there); values are never kept.
 - **onMetaData:** `videoTrackIdInfoMap` and `audioTrackIdInfoMap` are kept when sent (`track_maps`).
+- **the web UI:** a multitrack session's card shows each track beyond the first with its own live picture
+  (`/ws/preview/<session>?track=N`) and its stats, under the main picture (track 0).
 
 The `twitch-dual` profile (`rtmp://host:1935/twitch-dual/<key>`) adds Twitch Dual Format's rules: at least one
 16:9 and one 9:16 picture, the largest 9:16 one 1080x1920, track 0 the largest landscape one, every track's

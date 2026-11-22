@@ -61,6 +61,14 @@ main{padding:16px 20px;display:grid;gap:16px}
 .graphs canvas{width:100%;height:46px;display:block}
 .faults{display:flex;gap:6px;flex-wrap:wrap;padding:8px 14px;align-items:center;border-top:1px solid var(--line)}
 .faults .now{font-size:12px;color:var(--warn)}
+.tracks{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-start;padding:8px 14px;border-top:1px solid var(--line)}
+.tracks .th{flex:1 0 100%;font-size:12px;color:var(--dim)}
+.tracks figure{margin:0;max-width:100%}
+.tracks .tpv{position:relative;display:inline-block;min-width:160px;min-height:90px;background:#000;border-radius:6px;overflow:hidden;vertical-align:top}
+.tracks canvas{display:block;max-width:100%;max-height:300px;width:auto;height:auto}
+.tracks .msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px;color:#ccc;padding:8px;text-align:center}
+.tracks figcaption{font-size:11px;color:var(--dim);margin-top:4px;max-width:420px}
+.tracks figcaption.bad{color:var(--bad, #e5534b)}
 .thumbs{display:flex;gap:6px;overflow-x:auto;padding:8px 14px;border-top:1px solid var(--line)}
 .thumbs figure{margin:0;flex:0 0 auto;text-align:center}
 .thumbs img{height:54px;border-radius:4px;display:block;background:#000}
@@ -199,7 +207,72 @@ function makeCard(s0) {
   const thumbs = el("div", { class: "thumbs" });
   const log = el("div", { class: "log" });
   const links = el("div", { class: "links" });
-  root.append(head, pv, meters, stats, viol, graphs, faults, thumbs, log, links);
+  // Enhanced RTMP multitrack (Twitch Dual Format): each track beyond the first, its own picture
+  const tracksHead = el("div", { class: "th" });
+  const tracksEl = el("div", { class: "tracks", style: "display:none" }, tracksHead);
+  root.append(head, pv, tracksEl, meters, stats, viol, graphs, faults, thumbs, log, links);
+  const trackViews = new Map();
+  function trackView(t) {
+    const c = el("canvas", { width: 360, height: 640 });
+    const m = el("div", { class: "msg" }, "waiting for the first picture…");
+    const cap = el("figcaption", {}, `track ${t}`);
+    const fig = el("figure", {}, el("div", { class: "tpv" }, c, m), cap);
+    const g = c.getContext("2d");
+    let tws = null, dec = null, key = false, last = null, gone = false;
+    const say = x => { m.textContent = x; m.style.display = x ? "" : "none"; };
+    async function setup(u8) {
+      last = u8;
+      const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+      const n = u8[2], codec = new TextDecoder().decode(u8.slice(3, 3 + n));
+      const w = dv.getUint16(3 + n), h = dv.getUint16(5 + n), desc = u8.slice(7 + n);
+      const cfg = { codec, description: desc, codedWidth: w || undefined, codedHeight: h || undefined, optimizeForLatency: true };
+      let ok = false; try { ok = (await VideoDecoder.isConfigSupported(cfg)).supported; } catch { }
+      if (!ok) { say(`This browser can't decode ${codec}; the track's recording is in the links below.`); dec = null; return; }
+      if (dec && dec.state !== "closed") dec.close();
+      const mine = new VideoDecoder({
+        output: f => { if (c.width !== f.displayWidth) { c.width = f.displayWidth; c.height = f.displayHeight; } g.drawImage(f, 0, 0); f.close(); say(""); },
+        error: e => { say("decoder: " + e.message); if (dec === mine && last && !gone) { dec = null; setTimeout(() => setup(last), 200); } }
+      });
+      dec = mine; mine.configure(cfg); key = false;
+    }
+    async function onMsg(dv, u8) {
+      if (u8[0] === 1) await setup(u8);
+      else if (u8[0] === 2 && dec && dec.state === "configured") {
+        const k = u8[1] === 1; if (!key && !k) return; key = true;
+        if (dec.decodeQueueSize > 120) { key = false; return; }
+        dec.decode(new EncodedVideoChunk({ type: k ? "key" : "delta", timestamp: Number(dv.getBigInt64(2)), data: u8.subarray(10) }));
+      }
+    }
+    function open() {
+      if (!("VideoDecoder" in window)) { say("This browser can't decode video (WebCodecs)."); return; }
+      tws = new WebSocket(`ws://${location.host}/ws/preview/${encodeURIComponent(s0.id)}?track=${t}`);
+      tws.binaryType = "arraybuffer";
+      tws.onmessage = e => onMsg(new DataView(e.data), new Uint8Array(e.data));
+      tws.onclose = () => { if (!gone && cardState.state !== "ended") setTimeout(open, 1500); };
+    }
+    setTimeout(open, 50);
+    return { fig, cap, close() { gone = true; if (tws) tws.close(); if (dec && dec.state !== "closed") dec.close(); } };
+  }
+  function updateTracks(s) {
+    const tr = (s.tracks && s.tracks.tracks) || [];
+    tracksEl.style.display = tr.length ? "" : "none";
+    if (!tr.length) return;
+    const kq = s.client && s.client.key_query, er = s.client && s.client.enhanced_rtmp;
+    tracksHead.textContent = `${s.tracks.count} tracks (track 0 is the picture above) · ${fmt(s.tracks.total_video_kbps, 0)} kbps of picture in all`
+      + (kq ? ` · key query: ${kq.client_config_id ? "clientConfigId is there" : "no clientConfigId"}` : "")
+      + (er ? ` · Enhanced RTMP caps ${er.caps_ex}${er.multitrack ? " (multitrack)" : ""}` : "");
+    for (const t of tr) {
+      if (!t.has_video) continue;
+      if (!trackViews.has(t.track)) { const v = trackView(t.track); trackViews.set(t.track, v); tracksEl.append(v.fig); }
+      const tv = t.video || {}, sp = tv.sps, cap = trackViews.get(t.track).cap;
+      cap.textContent = `track ${t.track}: ${sp ? sp.width + "×" + sp.height : "?"} · ${fmt(tv.fps)} fps · ${fmt(tv.kbps, 0)} kbps (peak ${fmt(tv.peak_kbps, 0)})`
+        + ` · keyframe ${tv.keyint_last_s != null ? fmt(tv.keyint_last_s, 2) + " s" : "–"}${tv.b_frames ? " · B-frames" : ""}`
+        + ` · keyframes aligned ${t.keyframes_aligned}, not ${t.keyframes_misaligned}`
+        + (t.start_offset_ms != null ? ` · starts ${fmt(t.start_offset_ms, 0)} ms from track 0` : "")
+        + (tv.dts_backwards ? ` · ${tv.dts_backwards} timestamps backwards` : "");
+      cap.className = t.keyframes_misaligned || tv.dts_backwards ? "bad" : "";
+    }
+  }
 
   // preview
   let ws = null, vdec = null, adec = null, gotKey = false, acfg = null, nextT = 0, destroyed = false, vcfgDone = false;
@@ -313,6 +386,7 @@ function makeCard(s0) {
     const rtp = st.rtp; const rl = rtp.video.lost + rtp.audio.lost, rr = rtp.video.recovered + rtp.audio.recovered, rt = rtp.video.late + rtp.audio.late;
     set("rtp", rtp.active ? `${rl} / ${rr} / ${rt}${rtp.video.pictures_dropped ? " · " + rtp.video.pictures_dropped + " picture(s) dropped" : ""}` : "n/a (not WebRTC)", rl || rt ? "warn" : "");
     set("sess", `${s.reconnects} reconnect(s), grace used ${s.grace_uses}× (${s.grace_s} s)`);
+    updateTracks(s);
     meter(mL, lv.peak_l_db); meter(mR, lv.peak_r_db);
     lufs.textContent = lv.available ? `momentary ${fmt(lv.momentary_lufs)} LUFS · integrated ${fmt(lv.integrated_lufs)} LUFS · max peak ${fmt(lv.max_peak_db)} dBFS${lv.clipped_blocks ? " · CLIPPING" : ""}` : "levels need ffmpeg on this machine";
     viol.replaceChildren(...s.violations.map(x => el("span", { class: "chip " + (x.active ? (x.level === "warn" ? "warn" : "") : "cleared"), title: x.msg }, `${x.rule}${x.count > 1 ? " ×" + x.count : ""}: ${x.msg}`)));
@@ -338,7 +412,7 @@ function makeCard(s0) {
     links.replaceChildren(el("a", { href: `/api/sessions/${idq}/report`, target: "_blank" }, "report (JSON)"), el("a", { href: `/api/sessions/${idq}`, target: "_blank" }, "live stats (JSON)"), el("a", { href: `/api/sessions/${idq}/events`, target: "_blank" }, "events (JSON)"),
       ...s.segments.map(g => el("a", { href: `/media/${idq}/${g.file}`, download: g.file }, `${g.file} (${(g.bytes / 1e6).toFixed(1)} MB${g.probe ? ", plays" : ""})`)), el("span", { class: "dim" }, s.id));
   }
-  return { root, update, destroy() { destroyed = true; if (ws) ws.close(); if (vdec && vdec.state !== "closed") vdec.close(); api.stop(); } };
+  return { root, update, destroy() { destroyed = true; if (ws) ws.close(); if (vdec && vdec.state !== "closed") vdec.close(); api.stop(); for (const v of trackViews.values()) v.close(); } };
 }
 
 connectState();
