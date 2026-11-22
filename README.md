@@ -108,6 +108,11 @@ Per stream key (the same key on any platform), or `*` for every stream; from the
 end, so these are approximations of network trouble, not a network emulator; for packet-level loss and delay
 use a tool like `dnctl`/`pfctl` (macOS) or `tc netem` (Linux) in front of it.
 
+RTMP and RTMPS connections get a fixed 64 KB kernel receive buffer, so the backlog of a `throttle` or
+`freeze` stays in the sender's own buffers, where it can see it and adapt, as on a slow uplink. With the
+system's auto-tuned buffer (megabytes on localhost) a throttled stream's seconds of backlog sat unread at
+the lab: the sender saw nothing wrong, and the picture arrived late and then in a burst.
+
 ```sh
 stream-check fault mytest drop
 stream-check fault mytest throttle 800 --for 20

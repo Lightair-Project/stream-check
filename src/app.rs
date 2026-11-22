@@ -17,11 +17,29 @@ pub struct Running {
     pub cert: Option<std::path::PathBuf>,
 }
 
+/// How much an ingest connection's kernel receive buffer holds. A throttle is applied to what
+/// the lab reads, so whatever the kernel accepts beyond it hides the slow network from the
+/// sender: macOS grows a localhost receive buffer to megabytes, which swallowed seconds of a
+/// throttled stream (the sender saw no backlog and never adapted, and the picture arrived late
+/// and then in a burst). A slow uplink keeps that backlog in the sender's own buffer, as this
+/// does; 64 KB is still far more than a normal stream needs at local round-trip times.
+const INGEST_RECV_BUFFER: u32 = 64 * 1024;
+
+/// A TCP listener for an ingest (RTMP, RTMPS) with the receive buffer above, which the
+/// connections it accepts inherit.
+fn ingest_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+    socket.set_reuseaddr(true)?;
+    socket.set_recv_buffer_size(INGEST_RECV_BUFFER)?;
+    socket.bind(addr)?;
+    socket.listen(1024)
+}
+
 /// Binds every port (port 0 picks a free one) and starts serving.
 pub async fn start(cfg: Config) -> Result<Running, String> {
     let hub = Hub::new(cfg.clone());
     let bind = |p: u16| SocketAddr::from(([0, 0, 0, 0], p));
-    let rtmp = tokio::net::TcpListener::bind(bind(cfg.rtmp_port)).await.map_err(|e| format!("RTMP port {}: {e}", cfg.rtmp_port))?;
+    let rtmp = ingest_listener(bind(cfg.rtmp_port)).map_err(|e| format!("RTMP port {}: {e}", cfg.rtmp_port))?;
     let rtmp_addr = rtmp.local_addr().map_err(|e| e.to_string())?;
     tokio::spawn(crate::rtmp::listen(hub.clone(), rtmp, Proto::Rtmp, None));
 
@@ -32,7 +50,7 @@ pub async fn start(cfg: Config) -> Result<Running, String> {
             names.push(ip.to_string());
         }
         let (acceptor, path) = crate::tls::acceptor(&cfg.data_dir.join("tls"), names)?;
-        let l = tokio::net::TcpListener::bind(bind(port)).await.map_err(|e| format!("RTMPS port {port}: {e}"))?;
+        let l = ingest_listener(bind(port)).map_err(|e| format!("RTMPS port {port}: {e}"))?;
         rtmps_addr = l.local_addr().ok();
         cert = Some(path);
         tokio::spawn(crate::rtmp::listen(hub.clone(), l, Proto::Rtmps, Some(acceptor)));
