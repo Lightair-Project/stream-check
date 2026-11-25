@@ -34,6 +34,28 @@ fn note(level: Level, kind: &'static str, msg: impl Into<String>) -> Note {
     Note { level, kind, msg: msg.into() }
 }
 
+/// What the report counts as problems in a picture's timestamps.
+pub fn picture_timestamp_problems(v: &VideoStats) -> Vec<String> {
+    let mut out = vec![];
+    if v.dts_backwards > 0 {
+        out.push(format!("{} picture timestamps went backwards", v.dts_backwards));
+    }
+    if v.pts_before_dts > 0 {
+        out.push(format!(
+            "{} picture(s) presented before they are decoded (presentation time up to {:.0} ms before decode time; in FLV a negative composition time offset)",
+            v.pts_before_dts, v.pts_before_dts_max_ms
+        ));
+    }
+    if v.pts_duplicates > 0 {
+        out.push(format!("{} picture(s) with a presentation time another picture already has", v.pts_duplicates));
+    }
+    out
+}
+
+/// How many of the latest pictures' presentation times a new one is held against (well past any
+/// reordering a decoder allows: H.264 and HEVC hold at most 16 pictures).
+const RECENT_PTS: usize = 48;
+
 /// Counts bytes per second over a sliding window.
 #[derive(Debug, Default)]
 struct Rate {
@@ -111,7 +133,15 @@ pub struct VideoStats {
     pub max_consecutive_b: u32,
     pub reorder: bool,
     pub dts_backwards: u64,
+    /// Pictures whose presentation time repeats one already seen among the recent pictures
+    /// (B-frames given the same presentation time as another picture).
     pub pts_duplicates: u64,
+    /// Pictures presented before they are decoded: presentation time before decode time (in FLV
+    /// and Enhanced RTMP a negative composition time offset). No decoder can show a picture before
+    /// it has it, so players and platforms reject, re-time or drop them.
+    pub pts_before_dts: u64,
+    /// The most a picture's presentation time came before its decode time, ms.
+    pub pts_before_dts_max_ms: f64,
     pub gaps: u64,
     pub max_gap_ms: f64,
     pub largest_frame_bytes: u64,
@@ -325,7 +355,8 @@ pub struct Analyzer {
     frame_dts: VecDeque<i64>,
     prev_dts: Option<i64>,
     max_pts: Option<i64>,
-    last_pts: Option<i64>,
+    /// The presentation times of the latest pictures, to find one used twice.
+    recent_pts: VecDeque<i64>,
     recent_deltas: VecDeque<i64>,
     last_key_dts: Option<i64>,
     keyints: Vec<f64>,
@@ -376,7 +407,7 @@ impl Analyzer {
             frame_dts: VecDeque::new(),
             prev_dts: None,
             max_pts: None,
-            last_pts: None,
+            recent_pts: VecDeque::new(),
             recent_deltas: VecDeque::new(),
             last_key_dts: None,
             keyints: vec![],
@@ -436,7 +467,7 @@ impl Analyzer {
         self.amedia = MediaRate::default();
         self.prev_dts = None;
         self.max_pts = None;
-        self.last_pts = None;
+        self.recent_pts.clear();
         self.recent_deltas.clear();
         self.last_key_dts = None;
         self.gop.clear();
@@ -607,10 +638,37 @@ impl Analyzer {
             }
         }
         self.prev_dts = Some(dts);
-        if self.last_pts == Some(pts) {
-            v.pts_duplicates += 1;
+        // a picture presented before it is decoded, or at a time another picture already has
+        if pts < dts {
+            v.pts_before_dts += 1;
+            let ms = (dts - pts) as f64 / 1000.0;
+            v.pts_before_dts_max_ms = v.pts_before_dts_max_ms.max(ms);
+            if v.pts_before_dts == 1 {
+                out.push(note(
+                    Level::Error,
+                    "pts-before-dts",
+                    format!(
+                        "a picture is presented {ms:.0} ms before it is decoded (presentation {:.3} s, decode {:.3} s; in FLV a negative composition time offset)",
+                        pts as f64 / 1e6,
+                        dts as f64 / 1e6
+                    ),
+                ));
+            }
         }
-        self.last_pts = Some(pts);
+        if self.recent_pts.contains(&pts) {
+            v.pts_duplicates += 1;
+            if v.pts_duplicates == 1 {
+                out.push(note(
+                    Level::Error,
+                    "pts-duplicate",
+                    format!("two pictures have the same presentation time, {:.3} s", pts as f64 / 1e6),
+                ));
+            }
+        }
+        self.recent_pts.push_back(pts);
+        if self.recent_pts.len() > RECENT_PTS {
+            self.recent_pts.pop_front();
+        }
         if pts != dts {
             v.reorder = true;
         }

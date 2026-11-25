@@ -212,7 +212,14 @@ fn check(p: &Publisher, path: &Path) -> String {
         }
         PassSummary { last: Some(at), ..Default::default() }
     } else {
-        flv_pass(path, &maps, t0, &mut feed)
+        // an FLV is read as it is: ffmpeg's copy would re-time pictures whose composition time is
+        // negative (presented before they are decoded), hiding exactly what the check looks for
+        let flv = probe["format"]["format_name"].as_str() == Some("flv");
+        let direct = if flv { direct_flv_pass(path, t0, &mut feed) } else { None };
+        match direct {
+            Some(summary) => summary,
+            None => flv_pass(path, &maps, t0, &mut feed),
+        }
     };
     if let Some(e) = &summary.error {
         s.add_problem(format!("ffmpeg couldn't read the file to its end: {e}"));
@@ -502,6 +509,8 @@ struct PassSummary {
     error: Option<String>,
     /// What ffmpeg said while it still read the file to its end.
     warnings: Vec<String>,
+    /// The feed said stop before the end.
+    stopped: bool,
 }
 
 /// Where a pass's media goes.
@@ -607,35 +616,28 @@ fn track_pass(path: &Path, packets: Option<usize>, levels: Vec<(f64, Levels)>, t
     TrackResult { stats: feed.a.stats, notes: feed.notes }
 }
 
-/// The streams `maps` of the file copied out by ffmpeg as FLV and read tag by tag, each at its
-/// moment on the file's clock (`t0` is the file's start), with a tick every second of it.
-fn flv_pass(path: &Path, maps: &[usize], t0: Instant, feed: &mut dyn Feed) -> PassSummary {
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"]).arg(path);
-    for m in maps {
-        cmd.args(["-map", &format!("0:{m}")]);
-    }
-    cmd.args(["-c", "copy", "-f", "flv", "pipe:1"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return PassSummary { last: None, error: Some(format!("ffmpeg didn't start: {e}")), warnings: vec![] },
-    };
-    let mut stderr = child.stderr.take().unwrap();
-    let errs = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stderr.read_to_string(&mut s);
-        s
-    });
-    let mut r = std::io::BufReader::with_capacity(1 << 20, child.stdout.take().unwrap());
+/// An FLV file read tag by tag as it is (track 0's picture and sound; the other tracks are
+/// measured by their own passes), each at its moment on the file's clock. None when it has no
+/// tags this can read, for ffmpeg to try.
+fn direct_flv_pass(path: &Path, t0: Instant, feed: &mut dyn Feed) -> Option<PassSummary> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut r = std::io::BufReader::with_capacity(1 << 20, file);
+    let mut tags = 0u64;
+    let summary = read_tags(&mut r, t0, feed, true, &mut tags);
+    (tags > 0).then_some(summary)
+}
+
+/// Feeds the tags of an FLV byte stream into `feed` on the file's clock, with a tick every second
+/// of it; `track0_only` leaves out the multitrack tracks beyond the first.
+fn read_tags(r: &mut impl Read, t0: Instant, feed: &mut dyn Feed, track0_only: bool, tags: &mut u64) -> PassSummary {
     let mut demux = FlvDemux::new();
     let mut last = t0;
     let mut next_tick = t0 + Duration::from_secs(1);
     let mut base: Option<u32> = None;
     let mut stopped = false;
-    let mut n = 0u64;
-    read_flv(&mut r, |kind, ts, body| {
-        n += 1;
-        if n % 256 == 0 && feed.stop() {
+    read_flv(r, |kind, ts, body| {
+        *tags += 1;
+        if *tags % 256 == 0 && feed.stop() {
             stopped = true;
             return false;
         }
@@ -658,21 +660,55 @@ fn flv_pass(path: &Path, maps: &[usize], t0: Instant, feed: &mut dyn Feed) -> Pa
             feed.warn(w, now);
         }
         for m in out {
+            if track0_only && matches!(m, Media::Track(..)) {
+                continue;
+            }
             feed.media(m, now);
         }
         true
     });
+    feed.tick(last);
+    PassSummary { last: Some(last), error: None, warnings: vec![], stopped }
+}
+
+/// The streams `maps` of the file copied out by ffmpeg as FLV and read tag by tag, each at its
+/// moment on the file's clock (`t0` is the file's start), with a tick every second of it.
+fn flv_pass(path: &Path, maps: &[usize], t0: Instant, feed: &mut dyn Feed) -> PassSummary {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"]).arg(path);
+    for m in maps {
+        cmd.args(["-map", &format!("0:{m}")]);
+    }
+    cmd.args(["-c", "copy", "-f", "flv", "pipe:1"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return PassSummary { error: Some(format!("ffmpeg didn't start: {e}")), ..Default::default() },
+    };
+    let mut stderr = child.stderr.take().unwrap();
+    let errs = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
+    let mut r = std::io::BufReader::with_capacity(1 << 20, child.stdout.take().unwrap());
+    let mut tags = 0;
+    let read = read_tags(&mut r, t0, feed, false, &mut tags);
+    let (last, stopped) = (read.last.unwrap_or(t0), read.stopped);
     if stopped {
         let _ = child.kill();
     }
     let ok = child.wait().is_ok_and(|s| s.success());
-    feed.tick(last);
     let errors = errs.join().unwrap_or_default();
     let said: Vec<String> = errors.lines().filter(|l| !l.trim().is_empty()).take(20).map(str::to_string).collect();
     if ok || stopped {
-        return PassSummary { last: Some(last), error: None, warnings: said };
+        return PassSummary { last: Some(last), error: None, warnings: said, stopped };
     }
-    PassSummary { last: Some(last), error: Some(said.first().cloned().unwrap_or_else(|| "ffmpeg failed".into())), warnings: vec![] }
+    PassSummary {
+        last: Some(last),
+        error: Some(said.first().cloned().unwrap_or_else(|| "ffmpeg failed".into())),
+        warnings: vec![],
+        stopped,
+    }
 }
 
 /// The tags of an FLV byte stream: (tag type, timestamp in ms, body), until the end or until

@@ -1468,9 +1468,7 @@ impl Session {
                 problems.push(format!("rule broken: {} ({})", v.rule, v.msg));
             }
         }
-        if st.video.dts_backwards > 0 {
-            problems.push(format!("{} picture timestamps went backwards", st.video.dts_backwards));
-        }
+        problems.extend(crate::analyze::picture_timestamp_problems(&st.video));
         if st.audio.pts_backwards > 0 {
             problems.push(format!("{} sound timestamps went backwards", st.audio.pts_backwards));
         }

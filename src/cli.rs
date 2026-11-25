@@ -240,12 +240,14 @@ pub fn summary_text(r: &Value) -> String {
         );
     }
     out += &format!(
-        "  timing A/V offset {} ms, drift {} ms; {} stall(s); {} timestamp gap(s); {} backwards\n",
+        "  timing A/V offset {} ms, drift {} ms; {} stall(s); {} timestamp gap(s); {} backwards; {} presented before decoded, {} repeated presentation times\n",
         st["av"]["offset_ms"].as_f64().map_or("?".into(), |o| format!("{o:.0}")),
         st["av"]["drift_ms"].as_f64().map_or("?".into(), |o| format!("{o:.0}")),
         st["stalls"]["count"],
         v["gaps"].as_u64().unwrap_or(0) + a["gaps"].as_u64().unwrap_or(0),
         v["dts_backwards"].as_u64().unwrap_or(0) + a["pts_backwards"].as_u64().unwrap_or(0),
+        v["pts_before_dts"].as_u64().unwrap_or(0),
+        v["pts_duplicates"].as_u64().unwrap_or(0),
     );
     // Enhanced RTMP multitrack: the tracks beyond the first, and the total
     for t in r["tracks"]["tracks"].as_array().into_iter().flatten() {

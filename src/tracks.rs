@@ -266,9 +266,7 @@ impl Tracks {
         let mut out = vec![];
         for (id, t) in &self.list {
             let v = &t.analyzer.stats.video;
-            if v.dts_backwards > 0 {
-                out.push(format!("track {id}: {} picture timestamps went backwards", v.dts_backwards));
-            }
+            out.extend(crate::analyze::picture_timestamp_problems(v).into_iter().map(|p| format!("track {id}: {p}")));
             if t.misaligned > 0 {
                 out.push(format!("track {id}: {} keyframes not aligned with track 0's", t.misaligned));
             }

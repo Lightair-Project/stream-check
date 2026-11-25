@@ -357,9 +357,11 @@ function makeCard(s0) {
         + ` · keyframes aligned ${t.keyframes_aligned}, not ${t.keyframes_misaligned}`
         + (t.start_offset_ms != null ? ` · starts ${fmt(t.start_offset_ms, 0)} ms from track 0` : "")
         + (tv.dts_backwards ? ` · ${tv.dts_backwards} timestamps backwards` : "")
+        + (tv.pts_before_dts ? ` · ${tv.pts_before_dts} presented before decoded` : "")
+        + (tv.pts_duplicates ? ` · ${tv.pts_duplicates} repeated presentation time(s)` : "")
         + (tv.codec ? ` · ${String(tv.codec).toUpperCase()}` : "")
         + (bpmText(tv.bpm) ? ` · BPM ${bpmText(tv.bpm)}` : (tv.bpm && tv.bpm.keyframes_checked && !tv.bpm.present ? " · no BPM" : ""));
-      cap.className = t.keyframes_misaligned || tv.dts_backwards || (tv.bpm && tv.bpm.keyframes_missing) ? "bad" : "";
+      cap.className = t.keyframes_misaligned || tv.dts_backwards || tv.pts_before_dts || tv.pts_duplicates || (tv.bpm && tv.bpm.keyframes_missing) ? "bad" : "";
     }
   }
 
@@ -629,7 +631,8 @@ function makeCard(s0) {
     set("gop", v.gop_frames ? `${v.gop_frames} frames: ${v.gop_pattern}${v.b_frames ? " · B-frames" : ""}` : "–");
     if (sps && !v.codec) hide("gop");
     const tsBad = v.dts_backwards + a.pts_backwards; const gaps = v.gaps + a.gaps;
-    set("ts", tsBad ? `${tsBad} backwards` : gaps ? `${gaps} gap(s), max ${fmt(Math.max(v.max_gap_ms, a.max_gap_ms), 0)} ms` : "monotonic", tsBad ? "bad" : gaps ? "warn" : "");
+    const ptsBad = [v.pts_before_dts ? `${v.pts_before_dts} presented before decoded` : "", v.pts_duplicates ? `${v.pts_duplicates} repeated presentation time(s)` : ""].filter(Boolean).join(" · ");
+    set("ts", tsBad ? `${tsBad} backwards${ptsBad ? " · " + ptsBad : ""}` : ptsBad ? ptsBad : gaps ? `${gaps} gap(s), max ${fmt(Math.max(v.max_gap_ms, a.max_gap_ms), 0)} ms` : "monotonic", tsBad || ptsBad ? "bad" : gaps ? "warn" : "");
     set("stall", st.stalls.count ? `${st.stalls.count} · longest ${fmt(st.stalls.longest_ms, 0)} ms${st.stalls.stalled_now ? " · NOW" : ""}` : (st.stalls.stalled_now ? "stalled now" : "none"), st.stalls.stalled_now ? "bad" : st.stalls.count ? "warn" : "");
     set("av", st.av.offset_ms != null ? `${fmt(st.av.offset_ms, 0)} ms` : "–", st.av.offset_ms != null && Math.abs(st.av.offset_ms) > 100 ? "warn" : "");
     set("drift", st.av.drift_ms != null ? `${fmt(st.av.drift_ms, 0)} ms${st.av.drift_ms_per_min != null ? " (" + fmt(st.av.drift_ms_per_min, 1) + "/min)" : ""}` : "–");

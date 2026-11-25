@@ -193,6 +193,14 @@ The analyzer reads the H.264 and HEVC bitstream of every track (track 0 in `stat
   `sei_messages`, `cea608_field1` and `cea608_field2` (byte pairs with content), `cea708_packets`, `channels_608`
   ("CC1"…"CC4", from control codes), `services_708`, `recent_text` (the latest CEA-608 field-1 text, 80
   characters) and `last_at_s`. Event `captions` when they first arrive.
+- **Presentation against decode times** (every ingest, every track, files): `pts_before_dts` counts pictures
+  presented before they are decoded (presentation time before decode time: in FLV and Enhanced RTMP a negative
+  composition time offset, which ffprobe calls "Negative cts"), with `pts_before_dts_max_ms`; `pts_duplicates`
+  counts pictures whose presentation time repeats one of the 48 pictures before (B-frames given the same
+  presentation time). Both are problems in the report (events `pts-before-dts` and `pts-duplicate` on the first).
+  A correct B-frame stream (x264 `-bf 3` over RTMP or SRT, in MP4, MKV or FLV) has neither. WHIP and RTSP carry
+  one time per picture, so only repeats show there; an MP4's negative composition offsets are shifted by its
+  demuxer into a valid order, so only repeats show in MP4 files.
 - **`bitstream`**: `idr` (pictures with an IDR), `keyframes_not_idr` (marked key without an IDR: HEVC CRA, or an
   H.264 I picture with a recovery point; event `keyframe-not-idr`), `idr_not_marked` (an IDR the container doesn't
   mark key), `pictures_i`/`pictures_p`/`pictures_b` (by first slice), `sps_changes` (event `sps-changed`, saying
@@ -267,7 +275,8 @@ These go through a running Stream Check (`--url`, `$STREAM_CHECK_URL`, or the de
 so the session shows in its UI; otherwise, or with `--local`, they run in the command itself and write the
 report to `--data`. Running there, `pull` lasts until the source stops, `--for` runs out or Ctrl-C.
 
-- **Files:** ffmpeg is the demuxer: it copies the packets out as FLV, which the lab reads with its RTMP code,
+- **Files:** ffmpeg is the demuxer: it copies the packets out as FLV, which the lab reads with its RTMP code
+  (an FLV file is read as it is, since ffmpeg would re-time pictures with a negative composition time),
   and they go through the live analysis on the file's own clock (read as fast as the disk allows, measured
   as if it played: codec, profile and level, size, frame rate, keyframes, GOP, B-frames, timestamps, gaps,
   A/V offset, the profile's rules). `kbps` is the average over the file, `peak_kbps` the busiest 2 s.
@@ -332,7 +341,8 @@ stream-check list
 ### The report
 
 `<data>/sessions/<id>/report.json` next to the recording(s) `seg01.flv`, `seg02.flv`… and `thumbs/`:
-`ok` and `problems` (a verdict: broken platform rules, timestamps going backwards, recordings that don't
+`ok` and `problems` (a verdict: broken platform rules, timestamps going backwards, pictures presented before
+they are decoded or at a presentation time another picture already has, recordings that don't
 play, and for `twitch-dual` keyframes without BPM), the final stats (with the video bitstream's findings above),
 the series for graphs, every violation with when it began and how often, every
 connection (protocol, remote address, why it ended), the segments with ffprobe's description of each,
