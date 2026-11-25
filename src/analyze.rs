@@ -291,8 +291,8 @@ impl Analyzer {
                         }
                         sps.first().and_then(|s| nal::parse_sps(*codec, s))
                     }
-                    // AV1, VP9, VP8: the codec record says it (codecs agent: media::video_info)
-                    None => None,
+                    // AV1, VP9, VP8: the codec record says it
+                    None => crate::media::video_info(*codec, record),
                 };
                 if let Some(info) = info {
                     let changed = self.stats.video.sps.as_ref().is_some_and(|o| (o.width, o.height) != (info.width, info.height));
