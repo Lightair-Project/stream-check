@@ -214,7 +214,7 @@ thumbnails with their times, and the event log. Stalls, gaps and reconnects are 
   after the buffer gave up is dropped and counted, never taken for a new picture. A picture with missing packets is dropped
   (counted as such). The report's `stats.rtp` has `lost`, `recovered`, `late`, `duplicates` and pictures dropped per track.
 - WHIP takes H.264 (RFC 6184), HEVC (RFC 7798, without DONL), AV1 (the AV1 RTP payload format), VP9 (RFC 9628,
-  spatial layers joined into a superframe) and VP8 (RFC 7741), each with RTX, H.264 listed first in the answer;
+  spatial layers joined into a superframe) and VP8 (RFC 7741), each with RTX;
   the codec is the one negotiated for the track's SSRC. AV1, VP9 and VP8 pictures are measured the same way as
   over RTMP.
 - RTMP recordings are the FLV tags as sent; SRT recordings the transport stream as sent; WHIP recordings and
