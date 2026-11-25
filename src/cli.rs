@@ -287,6 +287,10 @@ pub fn summary_text(r: &Value) -> String {
     for p in r["problems"].as_array().into_iter().flatten() {
         out += &format!("  PROBLEM: {}\n", p.as_str().unwrap_or(""));
     }
+    let unchecked: Vec<&str> = r["recordings_not_checked"].as_array().into_iter().flatten().filter_map(|f| f.as_str()).collect();
+    if !unchecked.is_empty() {
+        out += &format!("  recordings not checked yet (ffprobe reads them when the session ends): {}\n", unchecked.join(", "));
+    }
     if let Some(ok) = r["ok"].as_bool() {
         out += &format!("  verdict: {}\n", if ok { "ok" } else { "problems found" });
     }

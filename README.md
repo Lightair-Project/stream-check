@@ -339,6 +339,11 @@ connection (protocol, remote address, why it ended), the segments with ffprobe's
 thumbnails with their times, and the event log. Stalls, gaps and reconnects are reported but are not
 "problems" by themselves, since faults cause them on purpose.
 
+ffprobe reads the recordings when the session ends. A report taken earlier (a live session, or one waiting
+in its grace period) lists them in `recordings_not_checked` and doesn't count them against the verdict; once
+checked, each segment has `checked`, and a recording ffprobe can't read has `probe_error` (ffprobe's own first
+error line), which is a problem.
+
 ## How it works, and what it can't tell you
 
 - Each ingest turns what arrives into the same events (parameter sets, pictures, audio packets), which

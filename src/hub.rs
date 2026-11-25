@@ -180,7 +180,19 @@ pub struct SegmentInfo {
     pub connection: u64,
     pub bytes: u64,
     pub started_s: f64,
+    /// ffprobe's description: the proof that it plays (set when the session ends).
     pub probe: Option<Value>,
+    /// Whether ffprobe has looked at it yet (it does when the session ends; a live or waiting
+    /// session's recordings aren't checked yet).
+    pub checked: bool,
+    /// ffprobe's own first error line, when it couldn't read the recording.
+    pub probe_error: Option<String>,
+}
+
+impl SegmentInfo {
+    fn new(file: String, container: &'static str, connection: u64, started_s: f64) -> SegmentInfo {
+        SegmentInfo { file, container, connection, bytes: 0, started_s, probe: None, checked: false, probe_error: None }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -762,7 +774,7 @@ impl Hub {
                 if self.cfg.ffmpeg {
                     pipeline.helper = Some(crate::helper::spawn(session.clone(), seg, session.dir.clone()));
                 }
-                g.segments.push(SegmentInfo { file, container: ext, connection: conn, bytes: 0, started_s, probe: None });
+                g.segments.push(SegmentInfo::new(file, ext, conn, started_s));
             } else {
                 pipeline.off = true;
             }
@@ -931,11 +943,20 @@ impl Hub {
         let segs: Vec<(usize, String)> = s.inner.lock().segments.iter().enumerate().map(|(i, x)| (i, x.file.clone())).collect();
         for (i, file) in segs {
             let path = s.dir.join(&file);
-            let probe = tokio::task::spawn_blocking(move || crate::helper::probe(&path)).await.ok().flatten();
+            let probe = if crate::helper::ffmpeg_available() {
+                tokio::task::spawn_blocking(move || crate::helper::probe(&path)).await.unwrap_or_else(|e| Err(e.to_string()))
+            } else {
+                Ok(None)
+            };
             let size = std::fs::metadata(s.dir.join(&file)).map(|m| m.len()).unwrap_or(0);
             let mut g = s.inner.lock();
-            g.segments[i].probe = probe;
-            g.segments[i].bytes = size;
+            let seg = &mut g.segments[i];
+            seg.checked = crate::helper::ffmpeg_available();
+            match probe {
+                Ok(p) => seg.probe = p,
+                Err(e) => seg.probe_error = Some(e),
+            }
+            seg.bytes = size;
         }
         let report = s.build_report();
         let _ = std::fs::write(s.dir.join("report.json"), serde_json::to_vec_pretty(&report).unwrap_or_default());
@@ -1190,7 +1211,7 @@ impl Session {
                 self.push_notes(&mut g, notes);
                 if let Some(file) = started {
                     let started_s = now.duration_since(self.t0).as_secs_f64();
-                    g.segments.push(SegmentInfo { file, container: "mkv", connection: conn, bytes: 0, started_s, probe: None });
+                    g.segments.push(SegmentInfo::new(file, "mkv", conn, started_s));
                 }
                 return;
             }
@@ -1444,11 +1465,13 @@ impl Session {
             problems.push("no media ever arrived".into());
         }
         problems.extend(g.tracks.problems());
+        // a recording counts once ffprobe has looked at it (when the session ends), not before
         for s in &g.segments {
-            if s.bytes > 0 && s.probe.is_none() && self.dir.join(&s.file).exists() && crate::helper::ffmpeg_available() {
-                problems.push(format!("{} doesn't play (ffprobe could not read it)", s.file));
+            if let Some(e) = &s.probe_error {
+                problems.push(format!("{} doesn't play: ffprobe says \"{e}\"", s.file));
             }
         }
+        let unchecked: Vec<&str> = g.segments.iter().filter(|s| !s.checked && s.probe_error.is_none()).map(|s| s.file.as_str()).collect();
         let thumbs = self.thumbs(&g);
         let series: Vec<_> = g.analyzer.series.iter().step_by(((g.analyzer.series.len() / 600) + 1).max(1)).cloned().collect();
         json!({
@@ -1457,6 +1480,7 @@ impl Session {
             "source": g.source,
             "ok": problems.is_empty(),
             "problems": problems,
+            "recordings_not_checked": unchecked,
             "platform": self.platform,
             "app": self.app,
             "key": self.key,

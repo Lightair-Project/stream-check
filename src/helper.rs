@@ -212,23 +212,26 @@ pub fn spawn(session: Arc<Session>, seg: u32, dir: PathBuf) -> mpsc::Sender<Vec<
     tx
 }
 
-/// What ffprobe makes of a recording: the proof that it plays.
-pub fn probe(path: &Path) -> Option<Value> {
+/// What ffprobe makes of a recording: the proof that it plays. `Ok(None)`: nothing to check (no
+/// file, or an empty one); `Err`: ffprobe couldn't read it, with ffprobe's own first error line.
+pub fn probe(path: &Path) -> Result<Option<Value>, String> {
     if std::fs::metadata(path).map_or(true, |m| m.len() == 0) {
-        return None;
+        return Ok(None);
     }
     let out = std::process::Command::new("ffprobe")
         .args(["-v", "error", "-show_format", "-show_streams", "-of", "json"])
         .arg(path)
         .output()
-        .ok()?;
+        .map_err(|e| format!("ffprobe didn't start: {e}"))?;
+    let first_error = || String::from_utf8_lossy(&out.stderr).lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string);
     if !out.status.success() {
-        return None;
+        return Err(first_error().unwrap_or_else(|| format!("ffprobe failed ({})", out.status)));
     }
-    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("ffprobe's answer couldn't be read: {e}"))?;
     let streams: Vec<Value> = v["streams"]
-        .as_array()?
-        .iter()
+        .as_array()
+        .into_iter()
+        .flatten()
         .map(|s| {
             json!({
                 "type": s["codec_type"],
@@ -242,11 +245,11 @@ pub fn probe(path: &Path) -> Option<Value> {
         })
         .collect();
     if streams.is_empty() {
-        return None;
+        return Err(first_error().unwrap_or_else(|| "ffprobe found no picture or sound in it".into()));
     }
-    Some(json!({
+    Ok(Some(json!({
         "format": v["format"]["format_name"],
         "duration_s": v["format"]["duration"].as_str().and_then(|d| d.parse::<f64>().ok()),
         "streams": streams,
-    }))
+    })))
 }
