@@ -5,6 +5,7 @@
 use serde::Serialize;
 
 use crate::analyze::{Level, Stats};
+use crate::levels;
 use crate::media::ACodec;
 use crate::nal::VCodec;
 
@@ -29,7 +30,21 @@ pub struct Profile {
     pub key_hint: &'static str,
     /// Twitch Dual Format's rules across an Enhanced RTMP multitrack stream's tracks.
     pub dual_format: bool,
+    /// H.264 profiles taken (profile_idc: 66 Baseline, 77 Main, 100 High…); empty: any.
+    pub h264_profiles: &'static [u8],
+    /// HEVC profiles taken (1 Main, 2 Main 10…); empty: any.
+    pub hevc_profiles: &'static [u8],
+    /// The platform expects limited-range video (a full-range tag is a warning).
+    pub limited_range: bool,
+    /// The platform shows HDR (PQ or HLG); otherwise an HDR transfer is a warning.
+    pub hdr_ok: bool,
+    /// Every keyframe on every track needs the broadcast performance metrics SEI in front of it
+    /// (Twitch Enhanced Broadcasting, Amazon IVS multitrack).
+    pub bpm_required: bool,
 }
+
+/// H.264 Baseline (and Constrained Baseline), Main, High.
+const H264_8BIT: &[u8] = &[66, 77, 100];
 
 pub const PROFILES: &[Profile] = &[
     Profile {
@@ -48,6 +63,11 @@ pub const PROFILES: &[Profile] = &[
         grace_s: 30,
         key_hint: "live_<digits>_<letters>",
         dual_format: false,
+        h264_profiles: H264_8BIT,
+        hevc_profiles: &[1],
+        limited_range: true,
+        hdr_ok: false,
+        bpm_required: false,
     },
     Profile {
         name: "twitch-dual",
@@ -66,11 +86,16 @@ pub const PROFILES: &[Profile] = &[
         grace_s: 30,
         key_hint: "live_<digits>_<letters>?clientConfigId=<id>",
         dual_format: true,
+        h264_profiles: H264_8BIT,
+        hevc_profiles: &[1],
+        limited_range: true,
+        hdr_ok: false,
+        bpm_required: true,
     },
     Profile {
         name: "youtube",
         label: "YouTube-like",
-        video_codecs: &[VCodec::H264, VCodec::Hevc],
+        video_codecs: &[VCodec::H264, VCodec::Hevc, VCodec::Av1],
         max_video_kbps: Some(51_000),
         max_keyint_s: Some(4.0),
         max_width: Some(3840),
@@ -83,6 +108,11 @@ pub const PROFILES: &[Profile] = &[
         grace_s: 10,
         key_hint: "xxxx-xxxx-xxxx-xxxx-xxxx",
         dual_format: false,
+        h264_profiles: H264_8BIT,
+        hevc_profiles: &[1, 2],
+        limited_range: true,
+        hdr_ok: true,
+        bpm_required: false,
     },
     Profile {
         name: "kick",
@@ -100,11 +130,16 @@ pub const PROFILES: &[Profile] = &[
         grace_s: 15,
         key_hint: "sk_<region>_<letters>",
         dual_format: false,
+        h264_profiles: H264_8BIT,
+        hevc_profiles: &[1],
+        limited_range: true,
+        hdr_ok: false,
+        bpm_required: false,
     },
     Profile {
         name: "open",
         label: "Open (accepts anything)",
-        video_codecs: &[VCodec::H264, VCodec::Hevc],
+        video_codecs: &[VCodec::H264, VCodec::Hevc, VCodec::Av1, VCodec::Vp9, VCodec::Vp8],
         max_video_kbps: None,
         max_keyint_s: None,
         max_width: None,
@@ -117,6 +152,11 @@ pub const PROFILES: &[Profile] = &[
         grace_s: 10,
         key_hint: "anything",
         dual_format: false,
+        h264_profiles: &[],
+        hevc_profiles: &[],
+        limited_range: false,
+        hdr_ok: true,
+        bpm_required: false,
     },
 ];
 
@@ -199,8 +239,70 @@ pub fn check(p: &Profile, s: &Stats, seconds_live: f64) -> Vec<Violation> {
     } else if p.audio_required && s.has_video && seconds_live > 5.0 {
         v("audio-missing", Level::Warn, format!("no audio after {seconds_live:.0} s; {} expects it", p.label));
     }
+    video_rules(p, s, None, &mut out);
     out
 }
+
+/// The rules on what the video bitstream says: profile, level, range, HDR, BPM. `track`: the
+/// multitrack track these stats are of (its rules are named `track-…`), or `None` for track 0.
+fn video_rules(p: &Profile, s: &Stats, track: Option<u8>, out: &mut Vec<Violation>) {
+    let (Some(codec), Some(sps)) = (s.video.codec, &s.video.sps) else { return };
+    let who = track.map_or(String::new(), |t| format!("track {t}: "));
+    let mut v = |rule: (&'static str, &'static str), level, msg: String| {
+        out.push(Violation { rule: if track.is_some() { rule.1 } else { rule.0 }, level, msg: format!("{who}{msg}") })
+    };
+    let taken = match codec {
+        VCodec::H264 => p.h264_profiles,
+        VCodec::Hevc => p.hevc_profiles,
+        _ => &[],
+    };
+    if p.video_codecs.contains(&codec) && !taken.is_empty() && !taken.contains(&sps.profile_idc) {
+        v(
+            ("video-profile", "track-video-profile"),
+            Level::Error,
+            format!("{} doesn't take {} {} video", p.label, codec.name(), sps.profile),
+        );
+    }
+    if let Some(first) = s.video.bitstream.level_warnings.first() {
+        let more = s.video.bitstream.level_warnings.len() - 1;
+        v(
+            ("video-level", "track-video-level"),
+            Level::Warn,
+            format!("level {} is too low: {first}{}", sps.level, if more > 0 { format!(" (and {more} more)") } else { String::new() }),
+        );
+    }
+    if p.limited_range && sps.colour.full_range == Some(true) {
+        v(
+            ("video-range", "track-video-range"),
+            Level::Warn,
+            format!("the picture is tagged full range; {} expects limited range", p.label),
+        );
+    }
+    if !p.hdr_ok && levels::is_hdr(sps) {
+        v(
+            ("video-hdr", "track-video-hdr"),
+            Level::Warn,
+            format!("an HDR transfer ({}); {} shows SDR", sps.colour.transfer_name.as_deref().unwrap_or("?"), p.label),
+        );
+    }
+    let b = &s.video.bpm;
+    if p.bpm_required && codec.is_nal() && b.keyframes_checked > 0 && !b.last_missing.is_empty() {
+        v(
+            ("bpm-missing", "track-bpm-missing"),
+            Level::Error,
+            format!(
+                "the latest keyframe had no BPM {} SEI in front of it ({} of {} keyframes); {} drops streams without the broadcast performance metrics before every IDR",
+                b.last_missing.join(", "),
+                b.keyframes_missing,
+                b.keyframes_checked,
+                p.label
+            ),
+        );
+    }
+}
+
+/// The frame rates Twitch Enhanced Broadcasting (Amazon IVS multitrack) takes.
+pub const DUAL_FRAME_RATES: &[f64] = &[24.0, 25.0, 30.0, 48.0, 50.0, 60.0];
 
 /// Twitch Dual Format's own total: picture across every track.
 pub const DUAL_MAX_TOTAL_KBPS: f64 = 12_500.0;
@@ -219,11 +321,47 @@ pub fn check_tracks(p: &Profile, s0: &Stats, tracks: &[(u8, &Stats)], seconds_li
             .map(|(id, s)| (*id, s.video.since_key_s.unwrap_or(0.0).max(s.video.keyint_last_s.unwrap_or(0.0))))
             .fold(None, |a: Option<(u8, f64)>, b| if a.is_none_or(|a| b.1 > a.1) { Some(b) } else { a });
         if let Some((id, w)) = worst.filter(|w| w.1 > max + 0.25) {
-            v("track-keyframe-interval", Level::Error, format!("track {id}: a keyframe every {w:.1} s; {} wants one at least every {max:.0} s", p.label));
+            v(
+                "track-keyframe-interval",
+                Level::Error,
+                format!("track {id}: a keyframe every {w:.1} s; {} wants one at least every {max:.0} s", p.label),
+            );
         }
     }
     if !p.dual_format {
         return out;
+    }
+    for (id, s) in tracks {
+        video_rules(p, s, Some(*id), &mut out);
+    }
+    let mut v = |rule, level, msg: String| out.push(Violation { rule, level, msg });
+    // a declared rate the service doesn't take (59.94 and 29.97 among them)
+    let odd: Vec<String> = std::iter::once((0u8, s0))
+        .chain(tracks.iter().map(|(id, s)| (*id, *s)))
+        .filter_map(|(id, s)| s.video.sps.as_ref()?.declared_fps.map(|f| (id, f)))
+        .filter(|(_, f)| !DUAL_FRAME_RATES.iter().any(|r| (f - r).abs() < 0.01))
+        .map(|(id, f)| format!("track {id} at {f:.3} fps"))
+        .collect();
+    if !odd.is_empty() {
+        v("dual-frame-rate", Level::Warn, format!("{}; {} takes 24, 25, 30, 48, 50 or 60", odd.join(", "), p.label));
+    }
+    // captions copied onto every track, so every rendition's viewers get them
+    let c0 = s0.video.captions.sei_messages;
+    let bare: Vec<String> = tracks
+        .iter()
+        .filter(|(_, s)| s.has_video && (c0 >= 10) != (s.video.captions.sei_messages >= 10))
+        .map(|(id, _)| format!("track {id}"))
+        .collect();
+    if !bare.is_empty() {
+        v(
+            "dual-captions",
+            Level::Warn,
+            if c0 >= 10 {
+                format!("captions on track 0 but not on {}; {} wants them on every track", bare.join(", "), p.label)
+            } else {
+                format!("captions on {} but not on track 0; {} wants them on every track", bare.join(", "), p.label)
+            },
+        );
     }
     // every picture with its size, track 0 first
     let sizes: Vec<(u8, u32, u32, f64)> = std::iter::once((0u8, s0))
@@ -249,19 +387,31 @@ pub fn check_tracks(p: &Profile, s0: &Stats, tracks: &[(u8, &Stats)], seconds_li
     }
     if let Some(big) = vertical.iter().max_by_key(|t| t.1 as u64 * t.2 as u64) {
         if (big.1, big.2) != (1080, 1920) {
-            v("dual-vertical-size", Level::Error, format!("the largest vertical track (track {}) is {}x{}; {} wants 1080x1920", big.0, big.1, big.2, p.label));
+            v(
+                "dual-vertical-size",
+                Level::Error,
+                format!("the largest vertical track (track {}) is {}x{}; {} wants 1080x1920", big.0, big.1, big.2, p.label),
+            );
         }
     }
     if let Some(big) = landscape.iter().max_by_key(|t| t.1 as u64 * t.2 as u64) {
         if big.0 != 0 {
-            v("dual-track0", Level::Error, format!("track 0 should be the largest landscape picture; track {} ({}x{}) is larger", big.0, big.1, big.2));
+            v(
+                "dual-track0",
+                Level::Error,
+                format!("track 0 should be the largest landscape picture; track {} ({}x{}) is larger", big.0, big.1, big.2),
+            );
         }
     } else if !vertical.is_empty() && sizes.first().is_some_and(|t| t.0 == 0 && t.2 > t.1) {
         v("dual-track0", Level::Error, "track 0 is vertical; it should be the largest landscape picture".into());
     }
     let total: f64 = sizes.iter().map(|t| t.3).sum();
     if total > DUAL_MAX_TOTAL_KBPS {
-        v("dual-bitrate", Level::Error, format!("{total:.0} kbps of picture across the tracks is over {}'s {DUAL_MAX_TOTAL_KBPS:.0}", p.label));
+        v(
+            "dual-bitrate",
+            Level::Error,
+            format!("{total:.0} kbps of picture across the tracks is over {}'s {DUAL_MAX_TOTAL_KBPS:.0}", p.label),
+        );
     }
     out
 }

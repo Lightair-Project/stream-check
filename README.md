@@ -75,7 +75,9 @@ forwards: Chrome, Edge and Safari; HEVC, AV1 and VP9 streams need the browser to
 back to thumbnails when it can't), an unmute button, level meters, and stats: codec, profile and level,
 resolution, measured frame rate, bitrate, keyframe interval, GOP structure, B-frames, timestamp
 monotonicity and gaps, A/V offset and drift, stalls, audio format, loudness (momentary, short-term, integrated
-LUFS), peaks, silence, reconnects and grace-period use, and every platform rule broken. Under the card:
+LUFS), peaks, silence, reconnects and grace-period use, what the video bitstream says (broadcast performance
+metrics, latency against the sender's clock, colour tags, level limits, captions, IDRs and SPS changes: see
+"The video bitstream"), and every platform rule broken. Under the card:
 graphs, fault buttons, a thumbnail timeline and the event log.
 
 ## Platform profiles
@@ -84,9 +86,30 @@ graphs, fault buttons, a thumbnail timeline and the event log.
 |---|---|---|---|---|---|
 | `twitch` | H.264, no B-frames | 8500 kbps | every 2 s | AAC 44.1/48 kHz | 30 s |
 | `twitch-dual` | Twitch Dual Format: H.264 (HEVC read), no B-frames, multitrack (below) | 12500 kbps across the tracks | every 2 s, every track | AAC 44.1/48 kHz | 30 s |
-| `youtube` | H.264, HEVC | 51000 kbps | every 4 s | AAC, Opus | 10 s |
+| `youtube` | H.264, HEVC, AV1 | 51000 kbps | every 4 s | AAC, Opus | 10 s |
 | `kick` | H.264, no B-frames | 8000 kbps | every 2 s | AAC 44.1/48 kHz | 15 s |
 | `open` | anything | no limit | any | anything | 10 s |
+
+Every profile also holds the video bitstream to these (rules named in the report; `track-…` for a multitrack
+track beyond the first):
+
+| Rule | Level | Profiles | When |
+|---|---|---|---|
+| `video-profile` | error | `twitch`, `twitch-dual`, `kick`: H.264 Baseline, Main, High, HEVC Main; `youtube`: also HEVC Main 10 | the codec profile isn't one the platform takes |
+| `video-level` | warning | all | the SPS's level is too low for the picture size, the frame rate, the peak bitrate or the reference frames |
+| `video-range` | warning | all but `open` | the picture is tagged full range; platforms expect limited (TV) range |
+| `video-hdr` | warning | `twitch`, `twitch-dual`, `kick` | a PQ or HLG transfer on a platform that shows SDR |
+| `bpm-missing` | error | `twitch-dual` | the latest keyframe on a track had no broadcast performance metrics SEI in front of it |
+| `dual-frame-rate` | warning | `twitch-dual` | a declared (VUI) frame rate other than 24, 25, 30, 48, 50 or 60 |
+| `dual-captions` | warning | `twitch-dual` | captions on some tracks but not all (IVS wants SEI copied onto every track) |
+
+**Why `twitch` doesn't require BPM and `twitch-dual` does:** Amazon IVS's multitrack guide (what Twitch's Enhanced
+Broadcasting runs on) lists broadcast performance metrics as a *required feature of multitrack video*, and puts
+"broadcast performance metrics do not precede every IDR on every track" among the reasons the *multitrack* ingest
+disconnects a client. Nothing in it, or in Twitch's own broadcast guidelines, asks it of an ordinary one-track RTMP
+stream, and Twitch takes such streams from encoders that never write BPM (ffmpeg, most hardware encoders). So
+`twitch` reports BPM when it's there and checks nothing; `twitch-dual` (Enhanced Broadcasting) fails a stream
+whose keyframes lack it.
 
 These are approximations of the platforms' published limits, for testing; they aren't a promise about the
 platforms. A stream that disconnects stays a *session* for the grace period (shown as "waiting"); if the same
@@ -134,6 +157,56 @@ follow OBS's reading of Twitch's answer; the values are the lab's own, not Twitc
 **A test sender:** `tools/ertmp-send.py` publishes a two-picture FLV (as ffmpeg 8 writes one) in any of the three
 multitrack layouts, with ModEx, multitrack audio, track maps and a key query; its header says how. ffmpeg 8 itself
 sends the `OneTrack` layout libobs uses (`ffmpeg ... -map 0:v -map 1:v -map 2:a ... -f flv rtmp://...`).
+
+## The video bitstream
+
+The analyzer reads the H.264 and HEVC bitstream of every track (track 0 in `stats.video`, the others in
+`tracks.tracks[].video`), whatever the ingest. What it adds to `video`:
+
+- **`sps`** (the parameter set in force) also has `bit_depth_chroma`, `ref_frames` (H.264 max_num_ref_frames,
+  HEVC's decoded picture buffer size), `high_tier` (HEVC), `vui` (whether the SPS has VUI) and `colour`:
+  `video_format`, `full_range` (absent: not tagged, which means limited), `primaries`, `transfer`, `matrix` (the
+  H.273 codes) with `primaries_name`, `transfer_name`, `matrix_name` ("BT.709", "PQ (SMPTE ST 2084)", "HLG"…), and
+  `chroma_loc_top`/`chroma_loc_bottom`. HEVC's `declared_fps` now comes from its VUI too.
+- **`bpm`**: the broadcast performance metrics, three "user data unregistered" SEI messages (timestamp `ts`, session
+  metrics `sm`, encoded rendition metrics `erm`, as Amazon IVS defines them) that Twitch Enhanced Broadcasting
+  wants in front of every IDR on every track. `present`; `keyframes_checked`, `keyframes_with_all`,
+  `keyframes_missing` and `every_keyframe` (a keyframe is an IDR or a picture the container marks key; the three
+  must come before its first slice); `last_missing` (what the latest keyframe lacked: `ts`, `sm`, `erm`);
+  `ts_messages`, `sm_messages`, `erm_messages`; `off_keyframe` (BPM on other pictures), `after_slice` (BPM after
+  the slice, so not "in front"), `malformed` (unreadable, or not in the form IVS reads: one RFC 3339 time of event
+  4, four session and three rendition counters); `last_time` (the latest timestamp as sent) and `last_event`;
+  `time_backwards`; `session` (`rendered`, `lagged`, `dropped`, `output`: the latest message's counts, since the
+  track's keyframe before) and `session_total`; `rendition` (`input`, `skipped`, `output`) and `rendition_total`;
+  `output_mismatches` (keyframes whose rendition `output` isn't the number of pictures that arrived since the
+  keyframe before). Events: `bpm` (first seen), `bpm-missing` (a keyframe without them, once BPM has been seen; the
+  first five, then every hundredth), `bpm-counters`, `bpm-malformed`, `bpm-form`.
+- **`latency`**: when the stream carries the sender's wall clock (the BPM timestamp, the encoder's "packet
+  interleave" time), the arrival time minus that clock: `source` ("bpm"), `samples`, `last_ms`, `min_ms`,
+  `avg_ms`, `max_ms`; the graph series has `latency_ms` (the latest value). It is the time from the sender handing
+  the picture to its connection to the lab having it whole, so the send queue and the network; it means that only
+  when both clocks agree (the same machine, or both synchronised by NTP).
+- **`captions`**: CEA-608 and CEA-708 in ATSC A/53 SEI (registered user data, "GA94"): `present`,
+  `sei_messages`, `cea608_field1` and `cea608_field2` (byte pairs with content), `cea708_packets`, `channels_608`
+  ("CC1"…"CC4", from control codes), `services_708`, `recent_text` (the latest CEA-608 field-1 text, 80
+  characters) and `last_at_s`. Event `captions` when they first arrive.
+- **`bitstream`**: `idr` (pictures with an IDR), `keyframes_not_idr` (marked key without an IDR: HEVC CRA, or an
+  H.264 I picture with a recovery point; event `keyframe-not-idr`), `idr_not_marked` (an IDR the container doesn't
+  mark key), `pictures_i`/`pictures_p`/`pictures_b` (by first slice), `sps_changes` (event `sps-changed`, saying
+  which fields changed: size, profile, level, bit depth, colour, frame rate…), `inband_sps` and
+  `inband_sps_differs` (SPS sent inside pictures, and those that differ from the one before),
+  `bad_nal_lengths` (pictures whose NAL lengths don't add up: start codes where lengths belong; event
+  `nal-lengths`), `sei` (SEI messages by payload type, "recovery point (6)": 12), `user_data` (other user data
+  unregistered messages: `uuid`, `count`, and `text` when it reads as text, as encoders write their name and
+  settings), `colour_warnings` and `level_warnings` (below).
+- **Colour warnings** (event `video-colour`): no VUI, no video signal type or no colour description; tags left
+  "unspecified"; BT.601 on an HD picture; primaries and matrix of different families; PQ or HLG without BT.2020
+  primaries or below 10 bits; the RGB matrix with subsampled chroma; luma and chroma at different depths.
+- **Level warnings** (event `video-level`): the level's limits against the picture (H.264 Table A-1: frame size in
+  macroblocks and on a side, macroblocks a second, the peak bitrate against MaxBR with the profile's factor,
+  reference frames against the picture buffer; HEVC: luma samples a picture and on a side, luma samples a second,
+  MaxBR by tier, the picture buffer). The frame rate is the measured one (3% slack), the bitrate the peak over 2 s
+  (10% slack), so they are a strong hint, not a conformance test.
 
 ## Fault injection
 
@@ -196,7 +269,8 @@ stream-check list
 
 `<data>/sessions/<id>/report.json` next to the recording(s) `seg01.flv`, `seg02.flv`… and `thumbs/`:
 `ok` and `problems` (a verdict: broken platform rules, timestamps going backwards, recordings that don't
-play), the final stats, the series for graphs, every violation with when it began and how often, every
+play, and for `twitch-dual` keyframes without BPM), the final stats (with the video bitstream's findings above),
+the series for graphs, every violation with when it began and how often, every
 connection (protocol, remote address, why it ended), the segments with ffprobe's description of each,
 thumbnails with their times, and the event log. Stalls, gaps and reconnects are reported but are not
 "problems" by themselves, since faults cause them on purpose.
@@ -229,7 +303,8 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 Permissive dependencies only. The code is organised as: `rtmp`, `srt`/`ts`, `whip` (ingests), `hub` (sessions,
-grace, faults, recordings, reports), `analyze`, `profiles`, `faults`, `http` and `ui.html`, `cli`.
+grace, faults, recordings, reports), `analyze`, `nal` (parameter sets), `sei` (BPM, captions, user data),
+`levels` (level limits, colour tags), `profiles`, `faults`, `http` and `ui.html`, `cli`.
 
 Stream Check was built to test Lightair's streaming, and is used for that, but has no ties to it.
 

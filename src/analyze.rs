@@ -1,14 +1,18 @@
 //! What the lab measures about a stream, from the same events whatever the protocol: codec and
 //! profile, size, frame rate, bitrate, keyframe interval, GOP, timestamps, stalls, A/V offset and
-//! drift, audio format and levels.
+//! drift, audio format and levels; and from the video bitstream: SEI (broadcast performance
+//! metrics, captions, user data), the sender's clock against arrival, colour tags, the level's
+//! limits, IDRs and SPS changes.
 
-use std::collections::VecDeque;
-use std::time::Instant;
+use std::collections::{BTreeMap, VecDeque};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::levels;
 use crate::media::{ACodec, Media, opus_toc, read_asc};
 use crate::nal::{self, HevcPps, PicType, Sps, VCodec};
+use crate::sei::{self, BpmKind};
 
 /// Something worth a line in the event log.
 #[derive(Debug, Clone)]
@@ -78,6 +82,117 @@ pub struct VideoStats {
     pub largest_frame_bytes: u64,
     /// Seconds since the last keyframe, as of the latest picture.
     pub since_key_s: Option<f64>,
+    /// What the bitstream itself says: IDRs, picture types, SPS changes, SEI, colour and level.
+    pub bitstream: Bitstream,
+    /// The broadcast performance metrics SEI (Twitch Enhanced Broadcasting, Amazon IVS).
+    pub bpm: BpmStats,
+    /// CEA-608 and CEA-708 captions (ATSC A/53 SEI).
+    pub captions: sei::CaptionStats,
+    /// Arrival time against the sender's own clock, when the stream carries one.
+    pub latency: LatencyStats,
+}
+
+/// What the video bitstream says beyond size and timing.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct Bitstream {
+    /// Pictures holding an IDR (H.264 type 5, HEVC IDR_W_RADL or IDR_N_LP).
+    pub idr: u64,
+    /// Pictures the container marks as keyframes that hold no IDR (HEVC CRA or BLA, or an H.264
+    /// I picture with a recovery point).
+    pub keyframes_not_idr: u64,
+    /// IDR pictures the container doesn't mark as keyframes.
+    pub idr_not_marked: u64,
+    /// Pictures by the type of their first slice.
+    pub pictures_i: u64,
+    pub pictures_p: u64,
+    pub pictures_b: u64,
+    /// Times the SPS changed mid-stream (a new sequence header, or an in-band SPS that differs).
+    pub sps_changes: u64,
+    /// Pictures carrying an SPS in-band, and how many of those differ from the one before.
+    pub inband_sps: u64,
+    pub inband_sps_differs: u64,
+    /// Pictures whose length-prefixed NAL units don't add up to the picture's size.
+    pub bad_nal_lengths: u64,
+    /// SEI messages by payload type ("recovery point (6)": 12).
+    pub sei: BTreeMap<String, u64>,
+    /// User data unregistered messages that aren't BPM (encoders write their name and settings).
+    pub user_data: Vec<sei::UserData>,
+    /// Colour tags that are missing, contradict each other or are unusual for the picture.
+    pub colour_warnings: Vec<String>,
+    /// Where the stream goes past its level's limits (size, rate, bitrate, reference frames).
+    pub level_warnings: Vec<String>,
+}
+
+/// Session metrics of a BPM SM message: frames since the track's previous keyframe.
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub struct SessionCounts {
+    pub rendered: u64,
+    pub lagged: u64,
+    pub dropped: u64,
+    pub output: u64,
+}
+
+/// Rendition metrics of a BPM ERM message: frames since the track's previous keyframe.
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub struct RenditionCounts {
+    pub input: u64,
+    pub skipped: u64,
+    pub output: u64,
+}
+
+/// The broadcast performance metrics a stream carries: three user data unregistered SEI
+/// messages (timestamp, session metrics, encoded rendition metrics) in front of every IDR.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct BpmStats {
+    /// Whether any BPM message arrived.
+    pub present: bool,
+    /// Keyframes (IDR, or marked key by the container) looked at.
+    pub keyframes_checked: u64,
+    /// Keyframes with all three messages before their first slice.
+    pub keyframes_with_all: u64,
+    /// Keyframes without one or more of them.
+    pub keyframes_missing: u64,
+    /// Whether every keyframe so far had all three (none until the first keyframe).
+    pub every_keyframe: Option<bool>,
+    /// What the latest keyframe lacked: "ts", "sm", "erm" (empty when it had all three).
+    pub last_missing: Vec<String>,
+    pub ts_messages: u64,
+    pub sm_messages: u64,
+    pub erm_messages: u64,
+    /// BPM messages on pictures that aren't keyframes.
+    pub off_keyframe: u64,
+    /// BPM messages after the picture's first slice instead of before it.
+    pub after_slice: u64,
+    /// BPM messages that couldn't be read, or aren't in the form IVS reads (session and rendition
+    /// metrics: one RFC 3339 time of event 4, four and three counters).
+    pub malformed: u64,
+    /// The latest timestamp message's time as sent, and its event (4: packet interleave).
+    pub last_time: Option<String>,
+    pub last_event: Option<u8>,
+    /// Timestamp messages whose time went back from the one before.
+    pub time_backwards: u64,
+    /// The latest session metrics, and their sum over the stream.
+    pub session: Option<SessionCounts>,
+    pub session_total: SessionCounts,
+    /// The latest rendition metrics, and their sum over the stream.
+    pub rendition: Option<RenditionCounts>,
+    pub rendition_total: RenditionCounts,
+    /// Keyframes whose rendition "output" isn't the number of pictures that arrived since the
+    /// keyframe before (pictures lost on the way, or counters that mean something else).
+    pub output_mismatches: u64,
+}
+
+/// Arrival time minus the sender's clock carried in the stream, in ms. Both clocks must agree
+/// (the same machine, or both synchronised) for it to mean the trip from the sender.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct LatencyStats {
+    /// Where the sender's clock came from: "bpm" (the BPM timestamp message).
+    pub source: Option<String>,
+    pub samples: u64,
+    pub last_ms: Option<f64>,
+    pub min_ms: Option<f64>,
+    pub avg_ms: Option<f64>,
+    pub max_ms: Option<f64>,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -138,6 +253,8 @@ pub struct Sample {
     pub lufs: Option<f64>,
     pub peak_db: Option<f64>,
     pub av_offset_ms: Option<f64>,
+    /// The latest arrival latency against the sender's clock (BPM), ms.
+    pub latency_ms: Option<f64>,
 }
 
 /// RTP receive statistics per track (WHIP only).
@@ -192,6 +309,20 @@ pub struct Analyzer {
     pub series: Vec<Sample>,
     silence_since: Option<f64>,
     last_levels_at: Option<Instant>,
+    /// The wall clock (ms since 1970) at `inst0`, for arrival times.
+    wall0_ms: f64,
+    inst0: Instant,
+    captions: sei::Captions,
+    /// The SPS in force, as bytes.
+    sps_raw: Option<Vec<u8>>,
+    last_bpm_ms: Option<f64>,
+    latency_sum: f64,
+    /// BPM misses said in the event log so far.
+    bpm_said: u64,
+    /// Kinds of note said once per session.
+    said: Vec<&'static str>,
+    /// The kinds of level excess found at the last tick.
+    level_kinds: Vec<&'static str>,
 }
 
 impl Analyzer {
@@ -227,6 +358,31 @@ impl Analyzer {
             series: vec![],
             silence_since: None,
             last_levels_at: None,
+            wall0_ms: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+            inst0: Instant::now(),
+            captions: sei::Captions::default(),
+            sps_raw: None,
+            last_bpm_ms: None,
+            latency_sum: 0.0,
+            bpm_said: 0,
+            said: vec![],
+            level_kinds: vec![],
+        }
+    }
+
+    /// The wall clock at `now`, ms since 1970.
+    fn wall_ms(&self, now: Instant) -> f64 {
+        match now.checked_duration_since(self.inst0) {
+            Some(d) => self.wall0_ms + d.as_secs_f64() * 1000.0,
+            None => self.wall0_ms - self.inst0.duration_since(now).as_secs_f64() * 1000.0,
+        }
+    }
+
+    /// A note said only the first time its kind comes up.
+    fn once(&mut self, out: &mut Vec<Note>, level: Level, kind: &'static str, msg: impl Into<String>) {
+        if !self.said.contains(&kind) {
+            self.said.push(kind);
+            out.push(note(level, kind, msg));
         }
     }
 
@@ -255,6 +411,7 @@ impl Analyzer {
         self.last_audio_arrival = None;
         self.last_video_arrival = None;
         self.in_stall = false;
+        self.last_bpm_ms = None;
     }
 
     fn stall_check(&mut self, now: Instant, out: &mut Vec<Note>) {
@@ -289,6 +446,7 @@ impl Analyzer {
                         if *codec == VCodec::Hevc {
                             self.pps = pps.iter().filter_map(|p| nal::parse_hevc_pps(p)).collect();
                         }
+                        self.sps_raw = sps.first().cloned();
                         sps.first().and_then(|s| nal::parse_sps(*codec, s))
                     }
                     // AV1, VP9, VP8: the codec record says it
@@ -301,17 +459,18 @@ impl Analyzer {
                             if changed { Level::Warn } else { Level::Info },
                             "video-config",
                             format!(
-                                "{} {} level {}, {}x{}{}",
+                                "{} {} level {}, {}x{}, {}{}",
                                 codec.name(),
                                 info.profile,
                                 info.level,
                                 info.width,
                                 info.height,
+                                colour_summary(&info),
                                 if changed { " (the resolution changed mid-stream)" } else { "" }
                             ),
                         ));
                     }
-                    self.stats.video.sps = Some(info);
+                    self.new_sps(*codec, info, "sequence header", &mut out);
                 }
             }
             Media::AudioConfig { codec, config, sample_rate, channels } => {
@@ -403,8 +562,23 @@ impl Analyzer {
         let c = pts as f64 / 1000.0 - now.duration_since(self.t0).as_secs_f64() * 1000.0;
         self.clock_v = Some(self.clock_v.map_or(c, |o| o * 0.95 + c * 0.05));
 
+        // the bitstream: NAL lengths, SEI, IDRs, in-band SPS
+        let nals = if codec.is_nal() { nal::split_lengths(data, 4) } else { vec![] };
+        if codec.is_nal() {
+            if nals.iter().map(|n| n.len() + 4).sum::<usize>() != data.len() {
+                self.stats.video.bitstream.bad_nal_lengths += 1;
+                self.once(
+                    out,
+                    Level::Error,
+                    "nal-lengths",
+                    "a picture's NAL unit lengths don't add up to its size (start codes where lengths belong, or a wrong length size)",
+                );
+            }
+            self.scan_nals(codec, &nals, key, now, out);
+        }
+        let v = &mut self.stats.video;
+
         // GOP
-        let nals = nal::split_lengths(data, 4);
         let mut ty = if key { Some(PicType::I) } else { None };
         if ty.is_none() {
             for n in &nals {
@@ -415,6 +589,11 @@ impl Analyzer {
             }
         }
         let ty = ty.unwrap_or(PicType::P);
+        match ty {
+            PicType::I => v.bitstream.pictures_i += 1,
+            PicType::P => v.bitstream.pictures_p += 1,
+            PicType::B => v.bitstream.pictures_b += 1,
+        }
         if ty == PicType::B {
             v.b_frames = true;
             self.consec_b += 1;
@@ -567,6 +746,20 @@ impl Analyzer {
                 v.fps = (self.frame_dts.len() - 1) as f64 / dspan;
             }
         }
+        // the level's limits against the measured rate and bitrate
+        let v = &self.stats.video;
+        if let (Some(codec), Some(sps)) = (v.codec, &v.sps) {
+            let fps = if v.fps > 0.0 { v.fps } else { sps.declared_fps.unwrap_or(0.0) };
+            let found = levels::level_problems(codec, sps, fps, v.peak_kbps);
+            // said when a kind of excess first shows (the numbers move from tick to tick)
+            for (kind, w) in &found {
+                if !self.level_kinds.contains(kind) {
+                    out.push(note(Level::Warn, "video-level", w.clone()));
+                }
+            }
+            self.level_kinds = found.iter().map(|f| f.0).collect();
+            self.stats.video.bitstream.level_warnings = found.into_iter().map(|f| f.1).collect();
+        }
         // A/V offset and drift
         if !self.offsets.is_empty() {
             let mut s: Vec<f64> = self.offsets.iter().copied().collect();
@@ -613,12 +806,292 @@ impl Analyzer {
                 .chain(self.stats.levels.peak_r_db)
                 .fold(None, |a: Option<f64>, b| Some(a.map_or(b, |a| a.max(b)))),
             av_offset_ms: self.stats.av.offset_ms,
+            latency_ms: self.stats.video.latency.last_ms,
         });
         if self.series.len() > 7200 {
             self.series.remove(0);
         }
         out
     }
+}
+
+impl Analyzer {
+    /// A parameter set came (sequence header or in-band): counts a change, says what changed and
+    /// checks the colour tags.
+    fn new_sps(&mut self, codec: VCodec, info: Sps, from: &str, out: &mut Vec<Note>) {
+        if let Some(old) = &self.stats.video.sps {
+            if *old == info {
+                return;
+            }
+            self.stats.video.bitstream.sps_changes += 1;
+            let what = sps_diff(old, &info);
+            out.push(note(
+                Level::Warn,
+                "sps-changed",
+                format!("the SPS changed mid-stream ({from}): {}", if what.is_empty() { "other fields".into() } else { what.join(", ") }),
+            ));
+        }
+        if codec.is_nal() || info.vui {
+            let found = levels::colour_problems(&info);
+            for w in &found {
+                if !self.stats.video.bitstream.colour_warnings.contains(w) {
+                    out.push(note(Level::Warn, "video-colour", w.clone()));
+                }
+            }
+            self.stats.video.bitstream.colour_warnings = found;
+        }
+        self.stats.video.sps = Some(info);
+    }
+
+    /// One picture's NAL units: SEI (BPM, captions, user data), IDRs, in-band SPS.
+    fn scan_nals(&mut self, codec: VCodec, nals: &[&[u8]], key: bool, now: Instant, out: &mut Vec<Note>) {
+        let t = now.duration_since(self.t0).as_secs_f64();
+        let (mut idr, mut slice_seen, mut bpm_any) = (false, false, false);
+        // timestamp, session metrics, rendition metrics before the first slice
+        let mut before = [false; 3];
+        let mut erm_output = None;
+        for n in nals {
+            if n.is_empty() {
+                continue;
+            }
+            let ty = nal::nal_type(codec, n);
+            if nal::is_slice(codec, ty) {
+                slice_seen = true;
+                idr |= matches!((codec, ty), (VCodec::H264, 5) | (VCodec::Hevc, 19 | 20));
+                continue;
+            }
+            if matches!((codec, ty), (VCodec::H264, 7) | (VCodec::Hevc, 33)) {
+                self.stats.video.bitstream.inband_sps += 1;
+                if self.sps_raw.as_deref() != Some(*n) {
+                    if self.sps_raw.is_some() {
+                        self.stats.video.bitstream.inband_sps_differs += 1;
+                    }
+                    self.sps_raw = Some(n.to_vec());
+                    if let Some(info) = nal::parse_sps(codec, n) {
+                        self.new_sps(codec, info, "in-band", out);
+                    }
+                }
+                continue;
+            }
+            if !sei::is_sei(codec, ty) {
+                continue;
+            }
+            for m in sei::messages(codec, n) {
+                *self.stats.video.bitstream.sei.entry(sei::type_name(codec, m.kind)).or_default() += 1;
+                match m.kind {
+                    sei::SEI_UNREGISTERED => match sei::bpm_kind(&m.payload) {
+                        Some(kind) => {
+                            bpm_any = true;
+                            if slice_seen {
+                                self.stats.video.bpm.after_slice += 1;
+                            } else {
+                                before[kind as usize] = true;
+                            }
+                            if let Some(o) = self.on_bpm(&m.payload, now, out) {
+                                erm_output = Some(o);
+                            }
+                        }
+                        None => sei::note_user_data(&mut self.stats.video.bitstream.user_data, &m.payload),
+                    },
+                    sei::SEI_REGISTERED => {
+                        if let Some(cc) = sei::a53_cc(&m.payload) {
+                            if !self.captions.stats.present {
+                                out.push(note(Level::Info, "captions", "captions in the picture (CEA-608/708 in A/53 SEI)"));
+                            }
+                            self.captions.feed(&cc, t);
+                            self.stats.video.captions = self.captions.stats.clone();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if idr {
+            self.stats.video.bitstream.idr += 1;
+        }
+        if key && !idr {
+            self.stats.video.bitstream.keyframes_not_idr += 1;
+            self.once(
+                out,
+                Level::Info,
+                "keyframe-not-idr",
+                "a keyframe that isn't an IDR (HEVC CRA, or an I picture with a recovery point)",
+            );
+        }
+        if idr && !key {
+            self.stats.video.bitstream.idr_not_marked += 1;
+            self.once(out, Level::Warn, "idr-not-marked", "an IDR picture the container doesn't mark as a keyframe");
+        }
+        let keyframe = key || idr;
+        let bpm = &mut self.stats.video.bpm;
+        if bpm_any && !keyframe {
+            bpm.off_keyframe += 1;
+        }
+        if !keyframe {
+            return;
+        }
+        bpm.keyframes_checked += 1;
+        bpm.last_missing = ["ts", "sm", "erm"].iter().zip(before).filter(|(_, had)| !had).map(|(n, _)| n.to_string()).collect();
+        if bpm.last_missing.is_empty() {
+            bpm.keyframes_with_all += 1;
+        } else {
+            bpm.keyframes_missing += 1;
+            // said when the sender writes BPM at all (a stream without any is checked by the profile)
+            if bpm.present && (self.bpm_said < 5 || bpm.keyframes_missing % 100 == 0) {
+                self.bpm_said += 1;
+                out.push(note(
+                    Level::Warn,
+                    "bpm-missing",
+                    format!(
+                        "a keyframe at {t:.1} s without the BPM {} SEI in front of it ({} so far)",
+                        bpm.last_missing.join(", "),
+                        bpm.keyframes_missing
+                    ),
+                ));
+            }
+        }
+        bpm.every_keyframe = Some(bpm.keyframes_missing == 0);
+        // the rendition's frames since the keyframe before, against the pictures that arrived
+        if let (Some(o), Some(_)) = (erm_output, self.last_key_dts) {
+            if o != self.gop_frames as u64 {
+                bpm.output_mismatches += 1;
+                if bpm.output_mismatches <= 3 {
+                    out.push(note(
+                        Level::Info,
+                        "bpm-counters",
+                        format!(
+                            "the BPM rendition metrics say {o} frames were output since the last keyframe; {} arrived",
+                            self.gop_frames
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// One BPM message: its counters and times, and the latency from its timestamp. Gives an
+    /// encoded rendition metrics message's "output" count.
+    fn on_bpm(&mut self, payload: &[u8], now: Instant, out: &mut Vec<Note>) -> Option<u64> {
+        let arrival = self.wall_ms(now);
+        let bpm = &mut self.stats.video.bpm;
+        if !bpm.present {
+            bpm.present = true;
+            out.push(note(Level::Info, "bpm", "broadcast performance metrics (BPM) SEI in the picture"));
+        }
+        let Some(m) = sei::bpm(payload) else {
+            bpm.malformed += 1;
+            self.once(out, Level::Warn, "bpm-malformed", "a BPM SEI message that can't be read");
+            return None;
+        };
+        let counter = |tag: u8| m.counters.iter().find(|c| c.0 == tag).map_or(0, |c| c.1 as u64);
+        let first = m.times.first();
+        let ivs_form = m.times.len() == 1
+            && first.is_some_and(|t| t.kind == 1 && t.event == 4)
+            && match m.kind {
+                BpmKind::Ts => true,
+                BpmKind::Sm => m.counters.len() == 4,
+                BpmKind::Erm => m.counters.len() == 3,
+            };
+        if !ivs_form && m.kind != BpmKind::Ts {
+            bpm.malformed += 1;
+            self.once(
+                out,
+                Level::Warn,
+                "bpm-form",
+                "a BPM metrics message not in the form IVS reads (one RFC 3339 time of event 4; four session or three rendition counters)",
+            );
+        }
+        let bpm = &mut self.stats.video.bpm;
+        let mut output = None;
+        match m.kind {
+            BpmKind::Ts => {
+                bpm.ts_messages += 1;
+                let t = m.times.iter().find(|t| t.event == 4 && t.unix_ms.is_some()).or(m.times.iter().find(|t| t.unix_ms.is_some()));
+                if let Some(t) = t {
+                    bpm.last_time = t.text.clone().or_else(|| t.unix_ms.map(|ms| format!("{ms:.0} ms since 1970")));
+                    bpm.last_event = Some(t.event);
+                    let sent = t.unix_ms.unwrap_or(0.0);
+                    if self.last_bpm_ms.is_some_and(|l| sent < l) {
+                        bpm.time_backwards += 1;
+                    }
+                    self.last_bpm_ms = Some(sent);
+                    let ms = arrival - sent;
+                    // a clock a day away is no clock to measure against
+                    if ms.abs() < 86_400_000.0 {
+                        let l = &mut self.stats.video.latency;
+                        l.source = Some("bpm".into());
+                        l.samples += 1;
+                        l.last_ms = Some(ms);
+                        l.min_ms = Some(l.min_ms.map_or(ms, |m| m.min(ms)));
+                        l.max_ms = Some(l.max_ms.map_or(ms, |m| m.max(ms)));
+                        self.latency_sum += ms;
+                        l.avg_ms = Some(self.latency_sum / l.samples as f64);
+                    }
+                }
+            }
+            BpmKind::Sm => {
+                bpm.sm_messages += 1;
+                let c = SessionCounts { rendered: counter(1), lagged: counter(2), dropped: counter(3), output: counter(4) };
+                let s = &mut bpm.session_total;
+                s.rendered += c.rendered;
+                s.lagged += c.lagged;
+                s.dropped += c.dropped;
+                s.output += c.output;
+                bpm.session = Some(c);
+            }
+            BpmKind::Erm => {
+                bpm.erm_messages += 1;
+                let c = RenditionCounts { input: counter(1), skipped: counter(2), output: counter(3) };
+                let r = &mut bpm.rendition_total;
+                r.input += c.input;
+                r.skipped += c.skipped;
+                r.output += c.output;
+                bpm.rendition = Some(c);
+                output = Some(c.output);
+            }
+        }
+        output
+    }
+}
+
+/// Range and colour tags in a few words: "limited range, BT.709".
+fn colour_summary(s: &Sps) -> String {
+    let c = &s.colour;
+    let range = match c.full_range {
+        Some(true) => "full range",
+        Some(false) => "limited range",
+        None => "range not tagged",
+    };
+    let colours = match (&c.primaries_name, &c.transfer_name, &c.matrix_name) {
+        (Some(p), Some(t), Some(m)) if p == t && t == m => p.clone(),
+        (Some(p), Some(t), Some(m)) => format!("primaries {p}, transfer {t}, matrix {m}"),
+        _ => "colours not tagged".into(),
+    };
+    format!("{range}, {colours}, {} bit", s.bit_depth)
+}
+
+/// What differs between two SPS, in words.
+fn sps_diff(a: &Sps, b: &Sps) -> Vec<String> {
+    let mut out = vec![];
+    let mut d = |name: &str, x: String, y: String| {
+        if x != y {
+            out.push(format!("{name} {x} → {y}"));
+        }
+    };
+    d("size", format!("{}x{}", a.width, a.height), format!("{}x{}", b.width, b.height));
+    d("profile", a.profile.clone(), b.profile.clone());
+    d("level", a.level.clone(), b.level.clone());
+    d("bit depth", a.bit_depth.to_string(), b.bit_depth.to_string());
+    d("chroma format", a.chroma_format.to_string(), b.chroma_format.to_string());
+    d("full range", format!("{:?}", a.colour.full_range), format!("{:?}", b.colour.full_range));
+    d("primaries", format!("{:?}", a.colour.primaries), format!("{:?}", b.colour.primaries));
+    d("transfer", format!("{:?}", a.colour.transfer), format!("{:?}", b.colour.transfer));
+    d("matrix", format!("{:?}", a.colour.matrix), format!("{:?}", b.colour.matrix));
+    d("declared fps", format!("{:?}", a.declared_fps), format!("{:?}", b.declared_fps));
+    d("reordering", format!("{:?}", a.max_reorder), format!("{:?}", b.max_reorder));
+    d("reference frames", format!("{:?}", a.ref_frames), format!("{:?}", b.ref_frames));
+    d("interlaced", a.interlaced.to_string(), b.interlaced.to_string());
+    out
 }
 
 /// "I P×29" for a frame-type run.

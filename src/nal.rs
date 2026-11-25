@@ -181,16 +181,131 @@ pub struct Sps {
     pub width: u32,
     pub height: u32,
     pub chroma_format: u8,
+    /// Bit depth of the luma samples.
     pub bit_depth: u8,
+    /// Bit depth of the chroma samples.
+    pub bit_depth_chroma: u8,
     /// Frame rate the stream declares (VUI timing), if it does.
     pub declared_fps: Option<f64>,
     /// Pictures that may precede one in output order (0: no B-frames or reordering).
     pub max_reorder: Option<u32>,
+    /// Reference frames (H.264 max_num_ref_frames) or the decoded picture buffer's size (HEVC
+    /// sps_max_dec_pic_buffering), for the level's buffer limit.
+    pub ref_frames: Option<u32>,
+    /// HEVC High tier (its levels allow higher bitrates).
+    pub high_tier: bool,
     pub interlaced: bool,
+    /// Whether the SPS carries VUI at all.
+    pub vui: bool,
+    /// The VUI's colour and format tags.
+    pub colour: Colour,
     /// The decoder's codec string for WebCodecs ("avc1.640028", "hvc1.1.6.L120.90").
     pub codec_string: String,
     #[serde(skip)]
     pub general: [u8; 12],
+}
+
+/// The colour tags of an SPS's VUI (video signal type and chroma location). `None`: not sent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Colour {
+    /// 0 component, 1 PAL, 2 NTSC, 3 SECAM, 4 MAC, 5 unspecified.
+    pub video_format: Option<u8>,
+    /// true: full range (0-255 at 8 bits); false: limited (16-235). Not sent means limited.
+    pub full_range: Option<bool>,
+    /// Colour primaries code (H.273): 1 BT.709, 5/6 BT.601, 9 BT.2020…
+    pub primaries: Option<u8>,
+    /// Transfer characteristics code: 1 BT.709, 13 sRGB, 16 PQ, 18 HLG…
+    pub transfer: Option<u8>,
+    /// Matrix coefficients code: 1 BT.709, 5/6 BT.601, 9 BT.2020 non-constant…
+    pub matrix: Option<u8>,
+    pub primaries_name: Option<String>,
+    pub transfer_name: Option<String>,
+    pub matrix_name: Option<String>,
+    /// Chroma sample location type, top and bottom field (0 left, 1 center, 2 top-left…).
+    pub chroma_loc_top: Option<u32>,
+    pub chroma_loc_bottom: Option<u32>,
+}
+
+impl Colour {
+    fn name(&mut self) {
+        self.primaries_name = self.primaries.map(|c| primaries_name(c).into());
+        self.transfer_name = self.transfer.map(|c| transfer_name(c).into());
+        self.matrix_name = self.matrix.map(|c| matrix_name(c).into());
+    }
+}
+
+pub fn primaries_name(c: u8) -> &'static str {
+    match c {
+        1 => "BT.709",
+        2 => "unspecified",
+        4 => "BT.470M",
+        5 => "BT.601 (625 lines)",
+        6 => "BT.601 (525 lines)",
+        7 => "SMPTE 240M",
+        8 => "film",
+        9 => "BT.2020",
+        10 => "SMPTE ST 428",
+        11 => "DCI-P3",
+        12 => "Display P3",
+        22 => "EBU 3213",
+        _ => "reserved",
+    }
+}
+
+pub fn transfer_name(c: u8) -> &'static str {
+    match c {
+        1 => "BT.709",
+        2 => "unspecified",
+        4 => "gamma 2.2",
+        5 => "gamma 2.8",
+        6 => "BT.601",
+        7 => "SMPTE 240M",
+        8 => "linear",
+        11 => "xvYCC",
+        13 => "sRGB",
+        14 => "BT.2020 10-bit",
+        15 => "BT.2020 12-bit",
+        16 => "PQ (SMPTE ST 2084)",
+        17 => "SMPTE ST 428",
+        18 => "HLG",
+        _ => "reserved",
+    }
+}
+
+pub fn matrix_name(c: u8) -> &'static str {
+    match c {
+        0 => "identity (RGB)",
+        1 => "BT.709",
+        2 => "unspecified",
+        4 => "FCC",
+        5 => "BT.601 (625 lines)",
+        6 => "BT.601 (525 lines)",
+        7 => "SMPTE 240M",
+        8 => "YCgCo",
+        9 => "BT.2020 non-constant",
+        10 => "BT.2020 constant",
+        14 => "ICtCp",
+        _ => "reserved",
+    }
+}
+
+/// The video signal type and chroma location of a VUI (H.264 and HEVC write them alike), from
+/// just after the overscan fields.
+fn vui_colour(b: &mut Bits, c: &mut Colour) -> Option<()> {
+    if b.flag()? {
+        c.video_format = Some(b.u(3)? as u8);
+        c.full_range = Some(b.flag()?);
+        if b.flag()? {
+            c.primaries = Some(b.u(8)? as u8);
+            c.transfer = Some(b.u(8)? as u8);
+            c.matrix = Some(b.u(8)? as u8);
+        }
+    }
+    if b.flag()? {
+        c.chroma_loc_top = Some(b.ue()? as u32);
+        c.chroma_loc_bottom = Some(b.ue()? as u32);
+    }
+    Some(())
 }
 
 fn h264_profile_name(p: u8, constraint: u8) -> String {
@@ -228,13 +343,14 @@ pub fn parse_h264_sps(nal: &[u8]) -> Option<Sps> {
     b.ue()?;
     let mut chroma = 1;
     let mut depth = 8;
+    let mut depth_chroma = 8;
     if matches!(profile_idc, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135) {
         chroma = b.ue()? as u8;
         if chroma == 3 {
             b.skip(1)?;
         }
         depth = 8 + b.ue()? as u8;
-        b.ue()?;
+        depth_chroma = 8 + b.ue()? as u8;
         b.skip(1)?;
         if b.flag()? {
             for i in 0..(if chroma != 3 { 8 } else { 12 }) {
@@ -265,7 +381,7 @@ pub fn parse_h264_sps(nal: &[u8]) -> Option<Sps> {
         }
         _ => {}
     }
-    b.ue()?;
+    let ref_frames = b.ue()? as u32;
     b.skip(1)?;
     let w_mbs = b.ue()? + 1;
     let h_map = b.ue()? + 1;
@@ -292,7 +408,9 @@ pub fn parse_h264_sps(nal: &[u8]) -> Option<Sps> {
     let height = (h_map * 16 * if frame_mbs_only { 1 } else { 2 } - (ct + cb) * crop_unit_y) as u32;
 
     let (mut declared_fps, mut max_reorder) = (None, None);
-    if b.flag().unwrap_or(false) {
+    let mut colour = Colour::default();
+    let vui = b.flag().unwrap_or(false);
+    if vui {
         let _ = (|| -> Option<()> {
             if b.flag()? && b.u(8)? == 255 {
                 b.skip(32)?;
@@ -300,16 +418,7 @@ pub fn parse_h264_sps(nal: &[u8]) -> Option<Sps> {
             if b.flag()? {
                 b.skip(1)?;
             }
-            if b.flag()? {
-                b.skip(4)?;
-                if b.flag()? {
-                    b.skip(24)?;
-                }
-            }
-            if b.flag()? {
-                b.ue()?;
-                b.ue()?;
-            }
+            vui_colour(&mut b, &mut colour)?;
             if b.flag()? {
                 let units = b.u(32)?;
                 let scale = b.u(32)?;
@@ -341,6 +450,7 @@ pub fn parse_h264_sps(nal: &[u8]) -> Option<Sps> {
             Some(())
         })();
     }
+    colour.name();
     Some(Sps {
         profile: h264_profile_name(profile_idc, constraint),
         profile_idc,
@@ -350,9 +460,14 @@ pub fn parse_h264_sps(nal: &[u8]) -> Option<Sps> {
         height,
         chroma_format: chroma,
         bit_depth: depth,
+        bit_depth_chroma: depth_chroma,
         declared_fps,
         max_reorder,
+        ref_frames: Some(ref_frames),
+        high_tier: false,
         interlaced: !frame_mbs_only,
+        vui,
+        colour,
         codec_string: format!("avc1.{profile_idc:02x}{constraint:02x}{level_idc:02x}"),
         general: [0; 12],
     })
@@ -408,19 +523,78 @@ pub fn parse_hevc_sps(nal: &[u8]) -> Option<Sps> {
         _ => (1, 1),
     };
     let depth = 8 + b.ue()? as u8;
-    b.ue()?;
-    b.ue()?;
+    let depth_chroma = 8 + b.ue()? as u8;
+    let poc_lsb_bits = b.ue()? as usize + 4;
     let present = b.flag()?;
-    let mut reorder = None;
+    let (mut reorder, mut dpb) = (None, None);
     let from = if present { 0 } else { max_sub };
     for i in from..=max_sub {
-        b.ue()?;
+        let buffering = b.ue()? + 1;
         let r = b.ue()?;
         b.ue()?;
         if i == max_sub {
             reorder = Some(r as u32);
+            dpb = Some(buffering as u32);
         }
     }
+    // the rest of the SPS, up to the VUI's timing: the colour tags and the declared frame rate
+    let (mut colour, mut declared_fps, mut vui) = (Colour::default(), None, false);
+    let _ = (|| -> Option<()> {
+        for _ in 0..6 {
+            b.ue()?;
+        }
+        if b.flag()? && b.flag()? {
+            hevc_scaling_list(&mut b)?;
+        }
+        b.skip(2)?;
+        if b.flag()? {
+            b.skip(8)?;
+            b.ue()?;
+            b.ue()?;
+            b.skip(1)?;
+        }
+        let sets = b.ue()? as usize;
+        if sets > 64 {
+            return None;
+        }
+        let mut deltas: Vec<usize> = vec![];
+        for i in 0..sets {
+            let n = hevc_st_rps(&mut b, i, &deltas)?;
+            deltas.push(n);
+        }
+        if b.flag()? {
+            for _ in 0..b.ue()? {
+                b.skip(poc_lsb_bits + 1)?;
+            }
+        }
+        b.skip(2)?;
+        vui = b.flag()?;
+        if !vui {
+            return Some(());
+        }
+        if b.flag()? && b.u(8)? == 255 {
+            b.skip(32)?;
+        }
+        if b.flag()? {
+            b.skip(1)?;
+        }
+        vui_colour(&mut b, &mut colour)?;
+        b.skip(3)?;
+        if b.flag()? {
+            for _ in 0..4 {
+                b.ue()?;
+            }
+        }
+        if b.flag()? {
+            let units = b.u(32)?;
+            let scale = b.u(32)?;
+            if units > 0 {
+                declared_fps = Some(scale as f64 / units as f64);
+            }
+        }
+        Some(())
+    })();
+    colour.name();
     let profile_name = match profile_idc {
         1 => "Main",
         2 => "Main 10",
@@ -451,12 +625,65 @@ pub fn parse_hevc_sps(nal: &[u8]) -> Option<Sps> {
         height: (h - (ct + cb) * sh) as u32,
         chroma_format: chroma,
         bit_depth: depth,
-        declared_fps: None,
+        bit_depth_chroma: depth_chroma,
+        declared_fps,
         max_reorder: reorder,
+        ref_frames: dpb,
+        high_tier: tier == 1,
         interlaced: flags >> 46 & 1 == 1 && flags >> 47 & 1 == 0,
+        vui,
+        colour,
         codec_string,
         general,
     })
+}
+
+/// Skips an HEVC scaling_list_data().
+fn hevc_scaling_list(b: &mut Bits) -> Option<()> {
+    for size in 0..4usize {
+        let step = if size == 3 { 3 } else { 1 };
+        let mut m = 0;
+        while m < 6 {
+            if !b.flag()? {
+                b.ue()?;
+            } else {
+                if size > 1 {
+                    b.se()?;
+                }
+                for _ in 0..64.min(1usize << (4 + (size << 1))) {
+                    b.se()?;
+                }
+            }
+            m += step;
+        }
+    }
+    Some(())
+}
+
+/// Skips the SPS's short-term reference picture set `idx`; gives its number of pictures.
+fn hevc_st_rps(b: &mut Bits, idx: usize, earlier: &[usize]) -> Option<usize> {
+    if idx != 0 && b.flag()? {
+        b.skip(1)?;
+        b.ue()?;
+        let mut n = 0;
+        for _ in 0..=*earlier.get(idx - 1)? {
+            let used = b.flag()?;
+            if used || b.flag()? {
+                n += 1;
+            }
+        }
+        Some(n)
+    } else {
+        let n = b.ue()? as usize + b.ue()? as usize;
+        if n > 32 {
+            return None;
+        }
+        for _ in 0..n {
+            b.ue()?;
+            b.skip(1)?;
+        }
+        Some(n)
+    }
 }
 
 fn return_profile(n: u8) -> &'static str {
