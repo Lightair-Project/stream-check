@@ -51,10 +51,13 @@ pub struct Tracks {
 }
 
 fn prefixed(track: u8, notes: Vec<Note>) -> Vec<Note> {
-    notes.into_iter().map(|mut n| {
-        n.msg = format!("track {track}: {}", n.msg);
-        n
-    }).collect()
+    notes
+        .into_iter()
+        .map(|mut n| {
+            n.msg = format!("track {track}: {}", n.msg);
+            n
+        })
+        .collect()
 }
 
 impl Tracks {
@@ -98,7 +101,9 @@ impl Tracks {
                         track.rec = Some(Rec { name: name.clone(), file, len, offsets: m.offsets, mkv: m });
                         started = Some(name);
                     }
-                    Err(e) => notes.push(Note { level: Level::Error, kind: "recording", msg: format!("track {id}: couldn't create {name}: {e}") }),
+                    Err(e) => {
+                        notes.push(Note { level: Level::Error, kind: "recording", msg: format!("track {id}: couldn't create {name}: {e}") })
+                    }
                 }
             }
             Media::Video { pts_us, dts_us, key, data } => {
@@ -131,7 +136,10 @@ impl Tracks {
                 notes.push(Note {
                     level: Level::Error,
                     kind: "track-base",
-                    msg: format!("track {id} starts {:.0} ms from track 0: the tracks should share one timestamp base", off as f64 / 1000.0),
+                    msg: format!(
+                        "track {id} starts {:.0} ms from track 0: the tracks should share one timestamp base",
+                        off as f64 / 1000.0
+                    ),
                 });
             }
         }
@@ -165,7 +173,8 @@ impl Tracks {
                             msg: format!(
                                 "track {id}'s keyframe at {:.2} s has no track-0 keyframe within one frame ({})",
                                 k as f64 / 1e6,
-                                nearest.map_or("track 0 has none near".to_string(), |d| format!("nearest {:.0} ms away", d as f64 / 1000.0))
+                                nearest
+                                    .map_or("track 0 has none near".to_string(), |d| format!("nearest {:.0} ms away", d as f64 / 1000.0))
                             ),
                         });
                     }
@@ -188,6 +197,13 @@ impl Tracks {
         self.keys0.clear();
         self.first0 = None;
         self.latest0 = None;
+    }
+
+    /// The connection ended: each track's bitrates as they were while media flowed.
+    pub fn connection_ended(&mut self) {
+        for t in self.list.values_mut() {
+            t.analyzer.connection_ended();
+        }
     }
 
     /// Closes the tracks' recordings: (file, bytes) of each.

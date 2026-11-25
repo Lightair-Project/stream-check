@@ -350,7 +350,10 @@ error line), which is a problem.
   feed the analyzer, the recorder, the browser preview and an ffmpeg helper (Matroska on its stdin) that
   decodes sound and pictures for loudness and thumbnails.
 - Timing numbers (fps, bitrate, keyframe interval) come from the stream's own timestamps and from arrival
-  times, both shown where they differ. WHIP carries no common clock for picture and sound without RTCP
+  times, both shown where they differ. A live `kbps` is the last two seconds of arrivals; when a connection
+  ends it becomes the last two seconds of the media's own timestamps, so a sender that goes quiet before its
+  connection is known to be gone (an SRT caller is noticed by the idle timeout, seconds later) keeps the rate
+  it sent at instead of zero. WHIP carries no common clock for picture and sound without RTCP
   sender reports, so the A/V offset of a WHIP stream is only as good as the first packets' arrival.
 - WHIP video and audio go through a small jitter buffer that restores sequence order: a packet that arrives late or as a
   retransmission (NACK, or RFC 4588 RTX, which the WebRTC stack unwraps) in time is slotted into its place; one that arrives

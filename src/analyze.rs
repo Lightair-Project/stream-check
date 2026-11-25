@@ -53,6 +53,41 @@ impl Rate {
     }
 }
 
+/// Counts bytes per second over the last two seconds of the media's own timestamps.
+#[derive(Debug, Default)]
+struct MediaRate {
+    samples: VecDeque<(i64, u64)>,
+}
+
+impl MediaRate {
+    const WINDOW_US: i64 = 2_000_000;
+
+    fn add(&mut self, t_us: i64, bytes: u64) {
+        if self.samples.back().is_some_and(|(last, _)| t_us < last - Self::WINDOW_US) {
+            // the timestamps started over
+            self.samples.clear();
+        }
+        self.samples.push_back((t_us, bytes));
+        let latest = self.samples.iter().map(|s| s.0).max().unwrap_or(t_us);
+        while self.samples.front().is_some_and(|(t, _)| latest - *t >= Self::WINDOW_US) {
+            self.samples.pop_front();
+        }
+    }
+
+    /// The rate over the window, or over the media there is when it's shorter (a frame's worth
+    /// of time added for the last one); none for less than a few packets.
+    fn kbps(&self) -> Option<f64> {
+        if self.samples.len() < 3 {
+            return None;
+        }
+        let (lo, hi) = self.samples.iter().fold((i64::MAX, i64::MIN), |(lo, hi), s| (lo.min(s.0), hi.max(s.0)));
+        let step = (hi - lo) / (self.samples.len() as i64 - 1);
+        let span = (hi - lo + step).clamp(1, Self::WINDOW_US) as f64 / 1e6;
+        let bytes: u64 = self.samples.iter().map(|s| s.1).sum();
+        Some(bytes as f64 * 8.0 / span / 1000.0)
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct VideoStats {
     pub codec: Option<VCodec>,
@@ -283,6 +318,9 @@ pub struct Analyzer {
     pub stats: Stats,
     vrate: Rate,
     arate: Rate,
+    /// The same by the media's timestamps, for the rates a finished connection keeps.
+    vmedia: MediaRate,
+    amedia: MediaRate,
     frame_arrivals: VecDeque<Instant>,
     frame_dts: VecDeque<i64>,
     prev_dts: Option<i64>,
@@ -332,6 +370,8 @@ impl Analyzer {
             stats: Stats::default(),
             vrate: Rate::default(),
             arate: Rate::default(),
+            vmedia: MediaRate::default(),
+            amedia: MediaRate::default(),
             frame_arrivals: VecDeque::new(),
             frame_dts: VecDeque::new(),
             prev_dts: None,
@@ -392,6 +432,8 @@ impl Analyzer {
 
     /// A new connection continues the session: timestamps start over, the history stays.
     pub fn restarted(&mut self) {
+        self.vmedia = MediaRate::default();
+        self.amedia = MediaRate::default();
         self.prev_dts = None;
         self.max_pts = None;
         self.last_pts = None;
@@ -412,6 +454,20 @@ impl Analyzer {
         self.last_video_arrival = None;
         self.in_stall = false;
         self.last_bpm_ms = None;
+    }
+
+    /// The connection ended: the bitrates become those of the last two seconds of media, by the
+    /// media's own timestamps. A sender can go quiet some seconds before its connection is known
+    /// to be gone (an SRT caller that stops sending is noticed by the peer's idle timeout), and
+    /// the once-a-second rates, which go by arrival, would be left at zero by those seconds.
+    pub fn connection_ended(&mut self) {
+        if let Some(k) = self.vmedia.kbps() {
+            self.stats.video.kbps = k;
+        }
+        if let Some(k) = self.amedia.kbps() {
+            self.stats.audio.kbps = k;
+        }
+        self.stats.total_kbps = self.stats.video.kbps + self.stats.audio.kbps;
     }
 
     fn stall_check(&mut self, now: Instant, out: &mut Vec<Note>) {
@@ -504,6 +560,7 @@ impl Analyzer {
         v.bytes += data.len() as u64;
         v.largest_frame_bytes = v.largest_frame_bytes.max(data.len() as u64);
         self.vrate.add(now, data.len() as u64);
+        self.vmedia.add(dts, data.len() as u64);
         self.frame_arrivals.push_back(now);
         self.frame_dts.push_back(dts);
         if self.frame_arrivals.len() > 120 {
@@ -642,6 +699,7 @@ impl Analyzer {
         a.bytes += data.len() as u64;
         let since_start = now.duration_since(self.t0).as_secs_f64() * 1000.0;
         self.arate.add(now, data.len() as u64);
+        self.amedia.add(pts, data.len() as u64);
         self.last_audio_arrival = Some(now);
         let mut frame_us = if a.frame_ms > 0.0 { (a.frame_ms * 1000.0) as i64 } else { 0 };
         if a.codec == Some(ACodec::Opus) {

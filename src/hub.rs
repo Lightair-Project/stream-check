@@ -397,6 +397,17 @@ pub struct Inner {
     stop_reason: Option<String>,
 }
 
+impl Inner {
+    /// The connection ended: the bitrates stay what they were while media flowed. A file read
+    /// faster than real time keeps the averages its reader set.
+    fn connection_ended(&mut self) {
+        if !self.virtual_clock {
+            self.analyzer.connection_ended();
+            self.tracks.connection_ended();
+        }
+    }
+}
+
 /// A preview's start for a new viewer: its config messages, and its pictures since the last
 /// keyframe.
 type PreviewStart = (Vec<Arc<Vec<u8>>>, Vec<Arc<Vec<u8>>>);
@@ -871,6 +882,7 @@ impl Hub {
                 c.ended_s = Some(t);
                 c.end_reason = Some(reason.clone());
             }
+            g.connection_ended();
             let seg = g.pipeline.finish();
             if let (Some((bytes, _)), Some(last)) =
                 (seg, g.segments.iter_mut().rev().find(|x| x.connection == conn && !x.file.contains("-track")))
@@ -926,6 +938,7 @@ impl Hub {
             g.ended_wall_ms = Some(now_ms());
             g.end_reason = Some(reason.clone());
             if g.conn.take().is_some() {
+                g.connection_ended();
                 let seg = g.pipeline.finish();
                 if let (Some((bytes, _)), Some(last)) = (seg, g.segments.iter_mut().rev().find(|x| !x.file.contains("-track"))) {
                     last.bytes = bytes;
