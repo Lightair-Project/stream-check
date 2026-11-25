@@ -11,6 +11,7 @@ use srt_tokio::SrtListener;
 
 use crate::analyze::Level;
 use crate::hub::{Hub, Proto};
+use crate::srt_stats;
 use crate::ts::TsDemux;
 
 /// `(app, key, mode)` out of a stream id.
@@ -36,7 +37,8 @@ pub fn parse_stream_id(id: &str) -> (String, String, Option<String>) {
 }
 
 pub async fn listen(hub: Arc<Hub>, bind: std::net::SocketAddr) -> std::io::Result<()> {
-    let (_listener, mut incoming) = SrtListener::builder().bind(bind).await?;
+    let (listener, mut incoming) = SrtListener::builder().bind(bind).await?;
+    let lab_latency_ms = listener.settings().recv_latency.as_millis() as u64;
     while let Some(request) = incoming.incoming().next().await {
         let id = request.stream_id().map(|s| s.to_string()).unwrap_or_default();
         let remote = request.remote();
@@ -67,6 +69,23 @@ pub async fn listen(hub: Arc<Hub>, bind: std::net::SocketAddr) -> std::io::Resul
                 }
             };
             publisher.session.event(Level::Info, "srt", format!("stream id '{id}'"));
+            let link = srt_stats::link(publisher.conn, socket.settings(), lab_latency_ms, publisher.session.t0.elapsed().as_secs_f64());
+            publisher.session.event(
+                Level::Info,
+                "srt",
+                format!(
+                    "SRT link: {} ms receive latency (the lab's {} ms or the sender's, whichever is larger), {:.0} ms handshake round trip, flow window {} packets{}",
+                    link.latency_ms,
+                    link.lab_latency_ms,
+                    link.handshake_rtt_ms,
+                    link.flow_window_pkts,
+                    link.encryption_bits.map_or(String::new(), |b| format!(", AES-{b}"))
+                ),
+            );
+            let stats = srt_stats::for_session(&publisher.session);
+            stats.lock().begin(link);
+            let mut socket_stats = socket.statistics().clone();
+            let mut fault_dropped = 0u64;
             let mut demux = TsDemux::new();
             let mut pending: Vec<u8> = vec![];
             let mut reported = (0u64, 0u64);
@@ -75,6 +94,13 @@ pub async fn listen(hub: Arc<Hub>, bind: std::net::SocketAddr) -> std::io::Resul
                 let item = tokio::select! {
                     _ = publisher.killed() => break "dropped by a fault (injected)".to_string(),
                     i = socket.next() => i,
+                    Some(st) = socket_stats.next() => {
+                        let notes = stats.lock().update(publisher.session.t0.elapsed().as_secs_f64(), &st, fault_dropped);
+                        for (level, msg) in notes {
+                            publisher.session.event(level, "srt", msg);
+                        }
+                        continue;
+                    }
                 };
                 let data = match item {
                     Some(Ok((_, d))) => d,
@@ -90,6 +116,7 @@ pub async fn listen(hub: Arc<Hub>, bind: std::net::SocketAddr) -> std::io::Resul
                     rng ^= rng >> 7;
                     rng ^= rng << 17;
                     if ((rng % 10_000) as f32) < loss * 100.0 {
+                        fault_dropped += 1;
                         continue;
                     }
                 }
@@ -126,6 +153,7 @@ pub async fn listen(hub: Arc<Hub>, bind: std::net::SocketAddr) -> std::io::Resul
                 }
                 pending.drain(..n);
             };
+            stats.lock().finish();
             let mut out = vec![];
             demux.finish(&mut out);
             for m in out {
