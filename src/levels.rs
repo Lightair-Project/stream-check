@@ -241,7 +241,7 @@ pub fn colour_problems(sps: &Sps) -> Vec<String> {
     if m == 0 && sps.chroma_format != 3 {
         out.push("the RGB (identity) matrix with subsampled chroma".into());
     }
-    if sps.bit_depth != sps.bit_depth_chroma {
+    if sps.bit_depth_chroma > 0 && sps.bit_depth != sps.bit_depth_chroma {
         out.push(format!("luma at {} bits and chroma at {}", sps.bit_depth, sps.bit_depth_chroma));
     }
     out
