@@ -7,7 +7,8 @@ and failures on demand. Everything is also a JSON API and a CLI, so a script (or
 run a streaming test and read the verdict without looking at a screen.
 
 - **Ingest:** RTMP, RTMPS (self-signed certificate), SRT listener (optional passphrase, `streamid`),
-  WHIP (HTTP endpoint, bearer token). H.264 and AAC; HEVC and Opus the Enhanced RTMP way; Opus over WHIP.
+  WHIP (HTTP endpoint, bearer token). H.264 and AAC; HEVC, AV1, VP9, VP8 and Opus the Enhanced RTMP way;
+  H.264, HEVC, AV1, VP9, VP8 and Opus over WHIP.
 - **Several streams at once**, told apart by platform and stream key, each its own session.
 - **Platform profiles** (Twitch-, YouTube- and Kick-like, plus an open one): they refuse wrong keys, flag
   streams that break the platform's rules (codec, bitrate, keyframe interval, resolution, audio) and keep
@@ -70,7 +71,7 @@ any key on every platform, or `--accept-key twitch=live_mykey` to accept only ce
 ## The UI
 
 One card per stream: a live preview (decoded in the browser with WebCodecs from the NAL units the lab
-forwards: Chrome, Edge and Safari; the preview needs HEVC support in the browser for HEVC streams, and falls
+forwards: Chrome, Edge and Safari; HEVC, AV1 and VP9 streams need the browser to decode them, and the preview falls
 back to thumbnails when it can't), an unmute button, level meters, and stats: codec, profile and level,
 resolution, measured frame rate, bitrate, keyframe interval, GOP structure, B-frames, timestamp
 monotonicity and gaps, A/V offset and drift, stalls, audio format, loudness (momentary, short-term, integrated
@@ -99,10 +100,15 @@ as classic FLV tags:
 
 - **connect:** the client's `capsEx`, `fourCcList`, `videoFourCcInfoMap` and `audioFourCcInfoMap` are kept
   (the report's `client.enhanced_rtmp`, and an event). The `_result` says the lab supports multitrack and ModEx
-  (`capsEx` 0x06) and decodes `avc1`, `hvc1`, `mp4a` and `Opus`.
+  (`capsEx` 0x06) and decodes `avc1`, `hvc1`, `av01`, `vp09`, `vp08`, `mp4a` and `Opus`.
 - **video:** extended headers with ModEx (TimestampOffsetNano), command frames and Metadata skipped, and
   `Multitrack` in all three layouts (`OneTrack`, `ManyTracks`, `ManyTracksManyCodecs`), with SequenceStart,
   CodedFrames, CodedFramesX and SequenceEnd in each track. A classic tag is track 0.
+- **AV1, VP9 and VP8:** the sequence start's AV1CodecConfigurationRecord or VP codec configuration record is read,
+  and the coded frames' own bitstream says the rest: AV1's sequence header (profile, level, tier, size, bit depth,
+  colour, declared frame rate) and which temporal units hold a shown key frame; a VP9 or VP8 key frame's header
+  (profile, size, bit depth), superframes included. Key frames are counted from the bitstream, not the tag's frame
+  type. The stats get the WebCodecs codec string (`av01.0.08M.08`, `vp09.00.40.08`, `vp8`) for the preview.
 - **audio:** the same with `Multitrack` audio; classic AAC is track 0.
 - **per track:** every track beyond the first is analysed on its own (codec, profile, size, frame rate,
   bitrate average and peak, keyframe interval, B-frames, timestamps) and recorded as its own playable file,
@@ -207,8 +213,13 @@ thumbnails with their times, and the event log. Stalls, gaps and reconnects are 
   retransmission (NACK, or RFC 4588 RTX, which the WebRTC stack unwraps) in time is slotted into its place; one that arrives
   after the buffer gave up is dropped and counted, never taken for a new picture. A picture with missing packets is dropped
   (counted as such). The report's `stats.rtp` has `lost`, `recovered`, `late`, `duplicates` and pictures dropped per track.
-- RTMP recordings are the FLV tags as sent; SRT recordings the transport stream as sent; WHIP recordings are
-  written as Matroska.
+- WHIP takes H.264 (RFC 6184), HEVC (RFC 7798, without DONL), AV1 (the AV1 RTP payload format), VP9 (RFC 9628,
+  spatial layers joined into a superframe) and VP8 (RFC 7741), each with RTX, H.264 listed first in the answer;
+  the codec is the one negotiated for the track's SSRC. AV1, VP9 and VP8 pictures are measured the same way as
+  over RTMP.
+- RTMP recordings are the FLV tags as sent; SRT recordings the transport stream as sent; WHIP recordings and
+  multitrack tracks beyond the first are written as Matroska (`V_AV1` with its av1C, `V_VP9`, `V_VP8`, H.264,
+  HEVC, AAC, Opus).
 
 ## Development
 
