@@ -3,6 +3,7 @@
 pub mod amf;
 pub mod analyze;
 pub mod app;
+pub mod av1;
 pub mod cli;
 pub mod faults;
 pub mod helper;
@@ -19,4 +20,5 @@ pub mod srt;
 pub mod tls;
 pub mod tracks;
 pub mod ts;
+pub mod vp9;
 pub mod whip;

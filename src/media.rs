@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::nal::{self, HevcPps, VCodec};
+use crate::nal::{self, HevcPps, Sps, VCodec};
+use crate::{av1, vp9};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -24,11 +25,15 @@ impl ACodec {
 
 #[derive(Debug, Clone)]
 pub enum Media {
-    /// avcC or hvcC: the parameter sets (before the first picture, and again when they change).
+    /// The codec record, before the first picture and again when it changes: avcC or hvcC (the
+    /// parameter sets), av1C with the sequence header, or for VP9 and VP8 a vpcC record followed
+    /// by the picture's width and height (see [`vp9::build_record`]).
     VideoConfig { codec: VCodec, record: Arc<Vec<u8>> },
     /// AudioSpecificConfig for AAC; empty for Opus.
     AudioConfig { codec: ACodec, config: Arc<Vec<u8>>, sample_rate: u32, channels: u8 },
-    /// One picture: 4-byte length-prefixed NAL units. Times in microseconds.
+    /// One picture: 4-byte length-prefixed NAL units (H.264, HEVC), a temporal unit of OBUs each
+    /// with its size and no temporal delimiter (AV1), or a frame or superframe (VP9, VP8).
+    /// Times in microseconds.
     Video { pts_us: i64, dts_us: i64, key: bool, data: Arc<Vec<u8>> },
     /// One AAC access unit (raw, no ADTS) or one Opus packet.
     Audio { pts_us: i64, data: Arc<Vec<u8>> },
@@ -105,6 +110,100 @@ impl AnnexB {
         }
         if self.sent.is_some() && rest.iter().any(|n| nal::is_slice(self.codec, nal::nal_type(self.codec, n))) {
             out.push(Media::Video { pts_us, dts_us, key, data: Arc::new(nal::to_lengths(&rest)) });
+        }
+    }
+}
+
+/// What the stats show about a video codec record: profile, level, size, bit depth and the
+/// WebCodecs codec string.
+pub fn video_info(codec: VCodec, record: &[u8]) -> Option<Sps> {
+    match codec {
+        VCodec::H264 => nal::read_avcc(record).and_then(|(_, sps, _)| nal::parse_sps(codec, sps.first()?)),
+        VCodec::Hevc => nal::read_hvcc(record).and_then(|(_, sps, _)| nal::parse_sps(codec, sps.first()?)),
+        VCodec::Av1 => av1::read_av1c(record).map(|(s, _)| av1::info(&s)),
+        VCodec::Vp9 => vp9::info(false, record),
+        VCodec::Vp8 => vp9::info(true, record),
+    }
+}
+
+/// Turns AV1, VP9 and VP8 frames into [`Media`]. Key frames are read from the bitstream. The
+/// codec record is passed on once the bitstream has said enough (AV1: a sequence header, from
+/// the sender's av1C or in band; VP9 and VP8: a key frame, for the picture's size), and again
+/// when it changes. Frames before the first record are dropped, as a decoder would.
+pub struct Frames {
+    pub codec: VCodec,
+    /// The sender's vpcC values (VP9, VP8).
+    vpcc: Option<[u8; 8]>,
+    /// AV1: the sequence header OBU's payload last passed on, and whether every frame is a key frame.
+    seq: Option<Vec<u8>>,
+    reduced: bool,
+    /// VP9, VP8: the size last passed on.
+    size: Option<(u32, u32)>,
+}
+
+impl Frames {
+    pub fn new(codec: VCodec) -> Self {
+        Frames { codec, vpcc: None, seq: None, reduced: false, size: None }
+    }
+
+    /// Whether a record has been passed on (frames are taken).
+    pub fn ready(&self) -> bool {
+        self.seq.is_some() || self.size.is_some()
+    }
+
+    /// The sender's own record (av1C or vpcC).
+    pub fn config(&mut self, record: &[u8], out: &mut Vec<Media>) {
+        match self.codec {
+            VCodec::Av1 => {
+                if let Some((s, _)) = av1::read_av1c(record) {
+                    let payload =
+                        av1::obus(&record[4..]).into_iter().find(|o| o.kind == av1::OBU_SEQUENCE_HEADER).map(|o| o.payload.to_vec());
+                    if payload.is_some() && payload != self.seq {
+                        self.seq = payload;
+                        self.reduced = s.reduced_still_picture_header;
+                        out.push(Media::VideoConfig { codec: self.codec, record: Arc::new(record.to_vec()) });
+                    }
+                }
+            }
+            _ => self.vpcc = vp9::read_vpcc(record),
+        }
+    }
+
+    /// One frame (AV1: a temporal unit). `key_hint` is what the container said, used only when
+    /// the bitstream can't be read.
+    pub fn frame(&mut self, pts_us: i64, dts_us: i64, key_hint: bool, data: &[u8], out: &mut Vec<Media>) {
+        let (key, data) = match self.codec {
+            VCodec::Av1 => {
+                let data = av1::normalise(data);
+                if let Some(o) = av1::obus(&data).into_iter().find(|o| o.kind == av1::OBU_SEQUENCE_HEADER) {
+                    if self.seq.as_deref() != Some(o.payload) {
+                        if let Some(s) = av1::parse_seq_header(o.payload) {
+                            self.seq = Some(o.payload.to_vec());
+                            self.reduced = s.reduced_still_picture_header;
+                            let record = av1::build_av1c(&s, o.whole);
+                            out.push(Media::VideoConfig { codec: self.codec, record: Arc::new(record) });
+                        }
+                    }
+                }
+                (av1::is_key(&data, self.reduced), data)
+            }
+            VCodec::Vp9 | VCodec::Vp8 => {
+                let f = if self.codec == VCodec::Vp9 { vp9::vp9_chunk(data) } else { vp9::vp8_frame(data) };
+                let key = f.map_or(key_hint, |f| f.key);
+                if let Some(f) = f.filter(|f| f.key && f.width > 0) {
+                    if self.size != Some((f.width, f.height)) {
+                        self.size = Some((f.width, f.height));
+                        let vpcc = vp9::build_vpcc(self.vpcc, &f, vp9::vp9_level_for(f.width, f.height));
+                        let record = vp9::build_record(&vpcc, f.width, f.height);
+                        out.push(Media::VideoConfig { codec: self.codec, record: Arc::new(record) });
+                    }
+                }
+                (key, data.to_vec())
+            }
+            VCodec::H264 | VCodec::Hevc => (key_hint, data.to_vec()),
+        };
+        if self.ready() && !data.is_empty() {
+            out.push(Media::Video { pts_us, dts_us, key, data: Arc::new(data) });
         }
     }
 }
