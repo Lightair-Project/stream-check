@@ -1,6 +1,6 @@
 //! RTP receive side for WHIP: a small jitter buffer that puts packets back in sequence order
 //! (late and retransmitted packets are slotted in, not mistaken for new pictures), and the
-//! assembly of H.264 pictures from packets in order.
+//! assembly of pictures from packets in order (H.264, HEVC, AV1, VP9, VP8: see [`crate::depay`]).
 //!
 //! Retransmissions (NACK, with or without RTX) reach this module as packets with an *older*
 //! sequence number and timestamp than the newest: the WebRTC stack unwraps RTX itself (the
@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::whip::H264Depay;
+use crate::depay::Depay;
+use crate::nal::VCodec;
 
 /// What one track's RTP looked like, for the report.
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
@@ -153,7 +154,8 @@ impl Reorder {
     }
 }
 
-/// A finished picture: its RTP timestamp and NAL units (no start codes).
+/// A finished picture: its RTP timestamp and NAL units (no start codes), or for AV1, VP9 and
+/// VP8 one unit: the whole frame.
 #[derive(Debug, Clone)]
 pub struct Picture {
     pub ts: u32,
@@ -166,15 +168,15 @@ fn newer(a: u32, b: u32) -> bool {
 
 struct Open {
     ts: u32,
-    depay: H264Depay,
+    depay: Depay,
     corrupt: bool,
 }
 
-/// Builds pictures from H.264 packets in sequence order. A picture ends on its marker bit or
+/// Builds pictures from packets in sequence order. A picture ends on its marker bit or
 /// when a newer timestamp starts; a packet with an older timestamp than the picture being built
 /// is dropped, never taken for a new picture.
-#[derive(Default)]
 pub struct Pictures {
+    codec: VCodec,
     cur: Option<Open>,
     last_ts: Option<u32>,
     pub pictures: u64,
@@ -182,7 +184,17 @@ pub struct Pictures {
     pub late: u64,
 }
 
+impl Default for Pictures {
+    fn default() -> Self {
+        Pictures::new(VCodec::H264)
+    }
+}
+
 impl Pictures {
+    pub fn new(codec: VCodec) -> Self {
+        Pictures { codec, cur: None, last_ts: None, pictures: 0, dropped: 0, late: 0 }
+    }
+
     pub fn packet(&mut self, p: Ordered, out: &mut Vec<Picture>) {
         if let Some(cur) = &mut self.cur {
             if p.ts == cur.ts {
@@ -201,7 +213,8 @@ impl Pictures {
             self.late += 1;
             return;
         }
-        let cur = self.cur.get_or_insert_with(|| Open { ts: p.ts, depay: H264Depay::default(), corrupt: p.gap_before });
+        let codec = self.codec;
+        let cur = self.cur.get_or_insert_with(|| Open { ts: p.ts, depay: Depay::new(codec), corrupt: p.gap_before });
         cur.depay.push(&p.payload);
         if p.marker {
             self.finish(out);
@@ -211,7 +224,7 @@ impl Pictures {
     fn finish(&mut self, out: &mut Vec<Picture>) {
         let Some(mut cur) = self.cur.take() else { return };
         self.last_ts = Some(cur.ts);
-        let nals = std::mem::take(&mut cur.depay.nals);
+        let nals = cur.depay.take();
         if nals.is_empty() {
             return;
         }
@@ -236,8 +249,13 @@ pub struct VideoAssembler {
 }
 
 impl VideoAssembler {
+    /// For H.264.
     pub fn new() -> Self {
-        VideoAssembler { reorder: Reorder::new(Duration::from_millis(120), 120), pictures: Pictures::default() }
+        Self::with_codec(VCodec::H264)
+    }
+
+    pub fn with_codec(codec: VCodec) -> Self {
+        VideoAssembler { reorder: Reorder::new(Duration::from_millis(120), 120), pictures: Pictures::new(codec) }
     }
 
     pub fn push(&mut self, seq: u16, ts: u32, marker: bool, payload: &[u8], now: Instant) -> Vec<Picture> {

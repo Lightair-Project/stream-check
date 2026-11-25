@@ -1,4 +1,4 @@
-//! A small Matroska writer: H.264, HEVC, AAC and Opus in clusters of known size. It makes the
+//! A small Matroska writer: H.264, HEVC, AV1, VP9, VP8, AAC and Opus in clusters of known size. It makes the
 //! recording of a WHIP stream, and the input the lab's ffmpeg helper decodes for loudness and
 //! thumbnails. Written so that a file that stops anywhere still plays, and so that a closing
 //! file can be given its true size and duration.
@@ -131,8 +131,18 @@ impl Mkv {
             uint(&mut t, 0xD7, n);
             uint(&mut t, 0x73C5, n);
             uint(&mut t, 0x83, 1);
-            text(&mut t, 0x86, if v.codec == VCodec::H264 { "V_MPEG4/ISO/AVC" } else { "V_MPEGH/ISO/HEVC" });
-            elem(&mut t, 0x63A2, &v.record);
+            let codec_id = match v.codec {
+                VCodec::H264 => "V_MPEG4/ISO/AVC",
+                VCodec::Hevc => "V_MPEGH/ISO/HEVC",
+                VCodec::Av1 => "V_AV1",
+                VCodec::Vp9 => "V_VP9",
+                VCodec::Vp8 => "V_VP8",
+            };
+            text(&mut t, 0x86, codec_id);
+            // VP9 and VP8 need no codec private data (the lab's record for them is its own)
+            if !matches!(v.codec, VCodec::Vp9 | VCodec::Vp8) {
+                elem(&mut t, 0x63A2, &v.record);
+            }
             let mut video = vec![];
             uint(&mut video, 0xB0, v.width as u64);
             uint(&mut video, 0xBA, v.height as u64);

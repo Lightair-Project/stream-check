@@ -1,5 +1,6 @@
 //! WHIP ingest: the HTTP exchange (an SDP offer posted with a bearer token, the answer back with
-//! a `Location`), a WebRTC peer that receives H.264 and Opus, and RTP read into [`Media`].
+//! a `Location`), a WebRTC peer that receives H.264, HEVC, AV1, VP9, VP8 and Opus, and RTP read
+//! into [`Media`].
 //! Sender time: WHIP carries no common clock without RTCP sender reports, so both tracks are
 //! placed on the arrival timeline at their first packet and then follow their own RTP clocks.
 
@@ -12,7 +13,9 @@ use parking_lot::Mutex;
 use rtc::interceptor::Registry;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
-use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_RTX, MediaEngine};
+use rtc::peer_connection::configuration::media_engine::{
+    MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_HEVC, MIME_TYPE_OPUS, MIME_TYPE_RTX, MIME_TYPE_VP8, MIME_TYPE_VP9, MediaEngine,
+};
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind};
 use tokio::sync::mpsc;
@@ -24,7 +27,7 @@ use webrtc::runtime::default_runtime;
 
 use crate::analyze::Level;
 use crate::hub::{Hub, Proto, Publisher};
-use crate::media::{ACodec, AnnexB, Media, opus_toc};
+use crate::media::{ACodec, AnnexB, Frames, Media, opus_toc};
 use crate::nal::VCodec;
 use crate::rtp::{AudioOrder, VideoAssembler};
 
@@ -48,6 +51,11 @@ impl PeerConnectionEventHandler for Handler {
         let _ = self.tracks.send(track);
     }
 }
+
+/// The video codecs offered besides H.264, H.264 first: (MIME type, payload type, its RTX payload
+/// type). No fmtp, so any profile of them matches.
+const OTHER_VIDEO: [(&str, u8, u8); 4] =
+    [(MIME_TYPE_HEVC, 49, 50), (MIME_TYPE_AV1, 45, 46), (MIME_TYPE_VP9, 98, 99), (MIME_TYPE_VP8, 96, 97)];
 
 fn codecs() -> Vec<(RTCRtpCodecParameters, RtpCodecKind)> {
     let mut out = vec![];
@@ -91,6 +99,23 @@ fn codecs() -> Vec<(RTCRtpCodecParameters, RtpCodecKind)> {
             },
             RtpCodecKind::Video,
         ));
+    }
+    for (mime, pt, rtx) in OTHER_VIDEO {
+        for (mime, pt, fmtp) in [(mime, pt, String::new()), (MIME_TYPE_RTX, rtx, format!("apt={pt}"))] {
+            out.push((
+                RTCRtpCodecParameters {
+                    rtp_codec: RTCRtpCodec {
+                        mime_type: mime.to_owned(),
+                        clock_rate: 90_000,
+                        channels: 0,
+                        sdp_fmtp_line: fmtp,
+                        rtcp_feedback: vec![],
+                    },
+                    payload_type: pt,
+                },
+                RtpCodecKind::Video,
+            ));
+        }
     }
     out.push((
         RTCRtpCodecParameters {
@@ -159,6 +184,27 @@ impl H264Depay {
     }
 }
 
+/// The lab's video codec for a negotiated MIME type.
+fn video_codec(mime: &str) -> Option<VCodec> {
+    let m = mime.to_ascii_lowercase();
+    [
+        (MIME_TYPE_H264, VCodec::H264),
+        (MIME_TYPE_HEVC, VCodec::Hevc),
+        (MIME_TYPE_AV1, VCodec::Av1),
+        (MIME_TYPE_VP9, VCodec::Vp9),
+        (MIME_TYPE_VP8, VCodec::Vp8),
+    ]
+    .into_iter()
+    .find(|(t, _)| t.to_ascii_lowercase() == m)
+    .map(|(_, c)| c)
+}
+
+/// Pictures into [`Media`]: parameter sets gathered for H.264 and HEVC, frames read for the others.
+enum VideoOut {
+    Nal(AnnexB),
+    Frames(Frames),
+}
+
 struct Clock {
     first_ts: u32,
     base_us: i64,
@@ -185,15 +231,15 @@ impl Clock {
 /// first (late and retransmitted ones included), then pictures are built from them.
 async fn read_track(track: Arc<dyn TrackRemote>, publisher: Arc<Publisher>, started: Instant) {
     enum Ev {
-        Packet(u16, u32, bool, Vec<u8>),
+        Packet(u16, u32, bool, u32, Vec<u8>),
         Tick,
         End,
     }
     let kind = track.kind().await;
     let audio = kind == RtpCodecKind::Audio;
-    let mut video = VideoAssembler::new();
+    // the video codec is known at the first packet (the negotiated one for its SSRC)
+    let mut video: Option<(VideoAssembler, VideoOut)> = None;
     let mut opus = AudioOrder::new();
-    let mut annexb = AnnexB::new(VCodec::H264);
     let mut clock: Option<Clock> = None;
     let mut audio_cfg = false;
     let mut tick = tokio::time::interval(Duration::from_millis(20));
@@ -201,7 +247,7 @@ async fn read_track(track: Arc<dyn TrackRemote>, publisher: Arc<Publisher>, star
     loop {
         let ev = tokio::select! {
             e = track.poll() => match e {
-                Some(TrackRemoteEvent::OnRtpPacket(p)) => Ev::Packet(p.header.sequence_number, p.header.timestamp, p.header.marker, p.payload.to_vec()),
+                Some(TrackRemoteEvent::OnRtpPacket(p)) => Ev::Packet(p.header.sequence_number, p.header.timestamp, p.header.marker, p.header.ssrc, p.payload.to_vec()),
                 Some(_) => continue,
                 None => Ev::End,
             },
@@ -212,23 +258,39 @@ async fn read_track(track: Arc<dyn TrackRemote>, publisher: Arc<Publisher>, star
         let mut pictures = vec![];
         let mut packets = vec![];
         match ev {
-            Ev::Packet(seq, ts, marker, payload) => {
+            Ev::Packet(seq, ts, marker, ssrc, payload) => {
                 if audio {
                     packets = opus.push(seq, ts, &payload, now);
                 } else {
-                    pictures = video.push(seq, ts, marker, &payload, now);
+                    if video.is_none() {
+                        let mime = track.codec(ssrc).await.map(|c| c.mime_type).unwrap_or_default();
+                        let codec = video_codec(&mime).unwrap_or_else(|| {
+                            publisher.session.event(
+                                Level::Warn,
+                                "unsupported",
+                                format!("WHIP video '{mime}' isn't one the lab reads; taken as H.264"),
+                            );
+                            VCodec::H264
+                        });
+                        publisher.session.event(Level::Info, "whip", format!("WHIP video is {}", codec.name()));
+                        let out = if codec.is_nal() { VideoOut::Nal(AnnexB::new(codec)) } else { VideoOut::Frames(Frames::new(codec)) };
+                        video = Some((VideoAssembler::with_codec(codec), out));
+                    }
+                    if let Some((v, _)) = video.as_mut() {
+                        pictures = v.push(seq, ts, marker, &payload, now);
+                    }
                 }
             }
             Ev::Tick => {
                 if audio {
                     packets = opus.tick(now);
-                } else {
-                    pictures = video.tick(now);
+                } else if let Some((v, _)) = video.as_mut() {
+                    pictures = v.tick(now);
                 }
             }
             Ev::End => {
-                if !audio {
-                    pictures = video.finish();
+                if let Some((v, _)) = video.as_mut() {
+                    pictures = v.finish();
                 }
             }
         }
@@ -246,16 +308,26 @@ async fn read_track(track: Arc<dyn TrackRemote>, publisher: Arc<Publisher>, star
         for pic in pictures {
             let c = clock.get_or_insert_with(|| Clock::new(pic.ts, started.elapsed().as_micros() as i64, rate));
             let pts = c.us(pic.ts);
-            let refs: Vec<&[u8]> = pic.nals.iter().map(|n| n.as_slice()).collect();
             let mut out = vec![];
-            annexb.picture(&refs, pts, pts, &mut out);
+            match video.as_mut().map(|v| &mut v.1) {
+                Some(VideoOut::Nal(annexb)) => {
+                    let refs: Vec<&[u8]> = pic.nals.iter().map(|n| n.as_slice()).collect();
+                    annexb.picture(&refs, pts, pts, &mut out);
+                }
+                Some(VideoOut::Frames(frames)) => {
+                    for f in &pic.nals {
+                        frames.frame(pts, pts, false, f, &mut out);
+                    }
+                }
+                None => {}
+            }
             for m in out {
                 publisher.media(m);
             }
         }
         if end || last_stats.elapsed() >= Duration::from_millis(500) {
             last_stats = Instant::now();
-            publisher.rtp(audio, if audio { opus.stats() } else { video.stats() });
+            publisher.rtp(audio, if audio { opus.stats() } else { video.as_ref().map(|v| v.0.stats()).unwrap_or_default() });
         }
         if end {
             return;

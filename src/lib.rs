@@ -5,6 +5,7 @@ pub mod analyze;
 pub mod app;
 pub mod av1;
 pub mod cli;
+pub mod depay;
 pub mod faults;
 pub mod helper;
 pub mod http;
