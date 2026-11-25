@@ -147,6 +147,8 @@ pub struct VideoStats {
     pub largest_frame_bytes: u64,
     /// Seconds since the last keyframe, as of the latest picture.
     pub since_key_s: Option<f64>,
+    /// Keyframe intervals held to the fixed interval the profile wants (Twitch: 2 s).
+    pub keyint_schedule: Option<KeySchedule>,
     /// What the bitstream itself says: IDRs, picture types, SPS changes, SEI, colour and level.
     pub bitstream: Bitstream,
     /// The broadcast performance metrics SEI (Twitch Enhanced Broadcasting, Amazon IVS).
@@ -155,6 +157,45 @@ pub struct VideoStats {
     pub captions: sei::CaptionStats,
     /// Arrival time against the sender's own clock, when the stream carries one.
     pub latency: LatencyStats,
+}
+
+/// Keyframe intervals held to a fixed interval, within one frame. Each connection's first
+/// interval may be short (the encoder's first GOP, or a keyframe forced at a reconnect) and isn't
+/// counted then.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct KeySchedule {
+    /// The interval wanted, in seconds.
+    pub target_s: f64,
+    /// How far an interval may be from it: one frame (plus a millisecond's rounding), in seconds.
+    pub tolerance_s: f64,
+    /// Intervals held to it, and how many of those weren't within the tolerance.
+    pub checked: u64,
+    pub off: u64,
+    /// Short first intervals of a connection let pass.
+    pub short_first_allowed: u64,
+    /// Whether the latest interval was off, and the shortest and longest off ones, in seconds.
+    pub last_off: bool,
+    pub last_s: Option<f64>,
+    pub off_min_s: Option<f64>,
+    pub off_max_s: Option<f64>,
+}
+
+impl KeySchedule {
+    fn interval(&mut self, s: f64, fps: f64, first_of_connection: bool) {
+        self.tolerance_s = 1.0 / fps.max(1.0) + 0.0015;
+        if first_of_connection && s < self.target_s - self.tolerance_s {
+            self.short_first_allowed += 1;
+            return;
+        }
+        self.checked += 1;
+        self.last_s = Some(s);
+        self.last_off = (s - self.target_s).abs() > self.tolerance_s;
+        if self.last_off {
+            self.off += 1;
+            self.off_min_s = Some(self.off_min_s.map_or(s, |m| m.min(s)));
+            self.off_max_s = Some(self.off_max_s.map_or(s, |m| m.max(s)));
+        }
+    }
 }
 
 /// What the video bitstream says beyond size and timing.
@@ -392,6 +433,10 @@ pub struct Analyzer {
     said: Vec<&'static str>,
     /// The kinds of level excess found at the last tick.
     level_kinds: Vec<&'static str>,
+    /// The fixed keyframe interval the platform wants (Twitch: 2 s), when it wants one.
+    pub keyint_target_s: Option<f64>,
+    /// Keyframe intervals measured on this connection so far.
+    conn_keyints: u64,
 }
 
 impl Analyzer {
@@ -438,6 +483,8 @@ impl Analyzer {
             bpm_said: 0,
             said: vec![],
             level_kinds: vec![],
+            keyint_target_s: None,
+            conn_keyints: 0,
         }
     }
 
@@ -470,6 +517,7 @@ impl Analyzer {
         self.recent_pts.clear();
         self.recent_deltas.clear();
         self.last_key_dts = None;
+        self.conn_keyints = 0;
         self.gop.clear();
         self.prev_audio_pts = None;
         self.frame_arrivals.clear();
@@ -729,6 +777,12 @@ impl Analyzer {
                 v.keyint_min_s = Some(self.keyints.iter().cloned().fold(f64::MAX, f64::min));
                 v.keyint_max_s = Some(self.keyints.iter().cloned().fold(0.0, f64::max));
                 v.keyint_avg_s = Some(self.keyints.iter().sum::<f64>() / self.keyints.len() as f64);
+                if let Some(target) = self.keyint_target_s {
+                    let fps = if v.fps > 0.0 { v.fps } else { v.sps.as_ref().and_then(|s| s.declared_fps).unwrap_or(30.0) };
+                    let first = self.conn_keyints == 0;
+                    self.conn_keyints += 1;
+                    v.keyint_schedule.get_or_insert_with(|| KeySchedule { target_s: target, ..Default::default() }).interval(s, fps, first);
+                }
             }
             self.last_key_dts = Some(dts);
             self.gop.clear();

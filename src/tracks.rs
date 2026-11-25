@@ -48,6 +48,8 @@ pub struct Tracks {
     keys0: VecDeque<i64>,
     first0: Option<i64>,
     latest0: Option<i64>,
+    /// The fixed keyframe interval the profile wants of every track, when it wants one.
+    pub keyint_target_s: Option<f64>,
 }
 
 fn prefixed(track: u8, notes: Vec<Note>) -> Vec<Note> {
@@ -78,8 +80,13 @@ impl Tracks {
     /// One message of track `id` (not 0): its notes, and the name of a recording it started.
     pub fn feed(&mut self, id: u8, m: Media, now: Instant, t0: Instant, dir: &Path, segment: u32) -> (Vec<Note>, Option<String>) {
         let first0 = self.first0;
+        let target = self.keyint_target_s;
         let track = self.list.entry(id).or_insert_with(|| Track {
-            analyzer: Analyzer::new(t0),
+            analyzer: {
+                let mut a = Analyzer::new(t0);
+                a.keyint_target_s = target;
+                a
+            },
             rec: None,
             first_dts: None,
             latest_dts: None,

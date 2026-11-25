@@ -17,6 +17,9 @@ pub struct Profile {
     pub max_video_kbps: Option<u32>,
     /// A keyframe at least this often, in seconds.
     pub max_keyint_s: Option<f64>,
+    /// Keyframes exactly this often, within a frame, in seconds (Twitch, and Enhanced
+    /// Broadcasting's `keyint_sec: 2`).
+    pub keyint_exact_s: Option<f64>,
     pub max_width: Option<u32>,
     pub max_height: Option<u32>,
     pub max_fps: Option<f64>,
@@ -53,6 +56,7 @@ pub const PROFILES: &[Profile] = &[
         video_codecs: &[VCodec::H264],
         max_video_kbps: Some(8500),
         max_keyint_s: Some(2.0),
+        keyint_exact_s: Some(2.0),
         max_width: Some(1920),
         max_height: Some(1080),
         max_fps: Some(60.5),
@@ -76,6 +80,7 @@ pub const PROFILES: &[Profile] = &[
         // the total across tracks is held against 12.5 Mbps instead (check_tracks)
         max_video_kbps: None,
         max_keyint_s: Some(2.0),
+        keyint_exact_s: Some(2.0),
         max_width: Some(1920),
         max_height: Some(1080),
         max_fps: Some(60.5),
@@ -98,6 +103,7 @@ pub const PROFILES: &[Profile] = &[
         video_codecs: &[VCodec::H264, VCodec::Hevc, VCodec::Av1],
         max_video_kbps: Some(51_000),
         max_keyint_s: Some(4.0),
+        keyint_exact_s: None,
         max_width: Some(3840),
         max_height: Some(2160),
         max_fps: Some(60.5),
@@ -120,6 +126,7 @@ pub const PROFILES: &[Profile] = &[
         video_codecs: &[VCodec::H264],
         max_video_kbps: Some(8000),
         max_keyint_s: Some(2.0),
+        keyint_exact_s: None,
         max_width: Some(1920),
         max_height: Some(1080),
         max_fps: Some(60.5),
@@ -142,6 +149,7 @@ pub const PROFILES: &[Profile] = &[
         video_codecs: &[VCodec::H264, VCodec::Hevc, VCodec::Av1, VCodec::Vp9, VCodec::Vp8],
         max_video_kbps: None,
         max_keyint_s: None,
+        keyint_exact_s: None,
         max_width: None,
         max_height: None,
         max_fps: None,
@@ -216,6 +224,9 @@ pub fn check(p: &Profile, s: &Stats, seconds_live: f64) -> Vec<Violation> {
             v("keyframe-interval", Level::Error, format!("a keyframe every {worst:.1} s; {} wants one at least every {max:.0} s", p.label));
         }
     }
+    if let Some(m) = keyframe_schedule(p, &s.video, None) {
+        v("keyframe-schedule", Level::Error, m);
+    }
     if let Some(sps) = &s.video.sps {
         if p.max_width.is_some_and(|w| sps.width > w) || p.max_height.is_some_and(|h| sps.height > h) {
             v("resolution", Level::Error, format!("{}x{} is bigger than {} takes", sps.width, sps.height, p.label));
@@ -241,6 +252,24 @@ pub fn check(p: &Profile, s: &Stats, seconds_live: f64) -> Vec<Violation> {
     }
     video_rules(p, s, None, &mut out);
     out
+}
+
+/// Whether the latest keyframe interval is off the fixed interval the platform wants, and what
+/// to say about it.
+fn keyframe_schedule(p: &Profile, v: &crate::analyze::VideoStats, track: Option<u8>) -> Option<String> {
+    let target = p.keyint_exact_s?;
+    let k = v.keyint_schedule.as_ref().filter(|k| k.last_off)?;
+    Some(format!(
+        "{}a keyframe {:.2} s after the one before; {} wants one every {target:.0} s (within a frame, {:.0} ms): {} of {} intervals off, {:.2} to {:.2} s",
+        track.map_or(String::new(), |t| format!("track {t}: ")),
+        k.last_s.unwrap_or(0.0),
+        p.label,
+        k.tolerance_s * 1000.0,
+        k.off,
+        k.checked,
+        k.off_min_s.unwrap_or(0.0),
+        k.off_max_s.unwrap_or(0.0),
+    ))
 }
 
 /// The rules on what the video bitstream says: profile, level, range, HDR, BPM. `track`: the
@@ -327,6 +356,9 @@ pub fn check_tracks(p: &Profile, s0: &Stats, tracks: &[(u8, &Stats)], seconds_li
                 format!("track {id}: a keyframe every {w:.1} s; {} wants one at least every {max:.0} s", p.label),
             );
         }
+    }
+    if let Some(m) = tracks.iter().filter(|(_, s)| s.has_video).find_map(|(id, s)| keyframe_schedule(p, &s.video, Some(*id))) {
+        v("track-keyframe-schedule", Level::Error, m);
     }
     if !p.dual_format {
         return out;

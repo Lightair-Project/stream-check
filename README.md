@@ -87,11 +87,19 @@ graphs, fault buttons, a thumbnail timeline and the event log.
 
 | Profile | Video | Bitrate | Keyframes | Audio | Grace |
 |---|---|---|---|---|---|
-| `twitch` | H.264, no B-frames | 8500 kbps | every 2 s | AAC 44.1/48 kHz | 30 s |
-| `twitch-dual` | Twitch Dual Format: H.264 (HEVC read), no B-frames, multitrack (below) | 12500 kbps across the tracks | every 2 s, every track | AAC 44.1/48 kHz | 30 s |
+| `twitch` | H.264, no B-frames | 8500 kbps | exactly every 2 s | AAC 44.1/48 kHz | 30 s |
+| `twitch-dual` | Twitch Dual Format: H.264 (HEVC read), no B-frames, multitrack (below) | 12500 kbps across the tracks | exactly every 2 s, every track | AAC 44.1/48 kHz | 30 s |
 | `youtube` | H.264, HEVC, AV1 | 51000 kbps | every 4 s | AAC, Opus | 10 s |
 | `kick` | H.264, no B-frames | 8000 kbps | every 2 s | AAC 44.1/48 kHz | 15 s |
 | `open` | anything | no limit | any | anything | 10 s |
+
+"Every 2 s" is two rules. `keyframe-interval` (all but `open`): no keyframe for longer than the profile's interval
+(plus 0.25 s). `keyframe-schedule` (`twitch`, `twitch-dual`; `track-keyframe-schedule` for the tracks beyond the first),
+an error: each interval between keyframes is 2 s within one frame (1/fps, plus a millisecond for rounding), as
+Twitch asks and as Enhanced Broadcasting's plans set (`keyint_sec: 2`); keyframes every 1.87 s break it. Each
+connection's first interval may be short (the encoder's first GOP, or a keyframe forced when it reconnects) and
+isn't held to it. `stats.video.keyint_schedule` has the numbers: `target_s`, `tolerance_s`, `checked`, `off`,
+`short_first_allowed`, `last_s`, `last_off`, `off_min_s`, `off_max_s`.
 
 Every profile also holds the video bitstream to these (rules named in the report; `track-…` for a multitrack
 track beyond the first):

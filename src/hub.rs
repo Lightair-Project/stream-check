@@ -864,6 +864,11 @@ impl Hub {
             preview: broadcast::channel(256).0,
             track_preview: broadcast::channel(512).0,
         });
+        {
+            let mut g = s.inner.lock();
+            g.analyzer.keyint_target_s = profile.keyint_exact_s;
+            g.tracks.keyint_target_s = profile.keyint_exact_s;
+        }
         self.sessions.lock().push(s.clone());
         s.event(Level::Info, "session", format!("new session {} on {} ({})", s.id, profile.label, profile.key_hint));
         s
