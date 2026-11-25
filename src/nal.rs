@@ -8,6 +8,9 @@ use serde::Serialize;
 pub enum VCodec {
     H264,
     Hevc,
+    Av1,
+    Vp9,
+    Vp8,
 }
 
 impl VCodec {
@@ -15,7 +18,15 @@ impl VCodec {
         match self {
             VCodec::H264 => "H.264",
             VCodec::Hevc => "HEVC",
+            VCodec::Av1 => "AV1",
+            VCodec::Vp9 => "VP9",
+            VCodec::Vp8 => "VP8",
         }
+    }
+
+    /// A codec whose pictures are NAL units (H.264, HEVC).
+    pub fn is_nal(self) -> bool {
+        matches!(self, VCodec::H264 | VCodec::Hevc)
     }
 }
 
@@ -74,6 +85,7 @@ pub fn nal_type(codec: VCodec, nal: &[u8]) -> u8 {
     match codec {
         VCodec::H264 => nal[0] & 0x1f,
         VCodec::Hevc => (nal[0] >> 1) & 0x3f,
+        _ => 0,
     }
 }
 
@@ -81,6 +93,7 @@ pub fn is_parameter_set(codec: VCodec, t: u8) -> bool {
     match codec {
         VCodec::H264 => matches!(t, 7 | 8),
         VCodec::Hevc => matches!(t, 32..=34),
+        _ => false,
     }
 }
 
@@ -89,6 +102,7 @@ pub fn is_slice(codec: VCodec, t: u8) -> bool {
     match codec {
         VCodec::H264 => matches!(t, 1 | 5),
         VCodec::Hevc => t < 32 && (t <= 9 || (16..=21).contains(&t)),
+        _ => false,
     }
 }
 
@@ -96,6 +110,7 @@ pub fn is_keyframe_nal(codec: VCodec, t: u8) -> bool {
     match codec {
         VCodec::H264 => t == 5,
         VCodec::Hevc => (16..=21).contains(&t),
+        _ => false,
     }
 }
 
@@ -508,6 +523,7 @@ pub fn slice_type(codec: VCodec, nal: &[u8], pps: &[(u64, HevcPps)]) -> Option<P
                 _ => PicType::I,
             })
         }
+        _ => None,
     }
 }
 
@@ -610,6 +626,7 @@ pub fn parse_sps(codec: VCodec, nal: &[u8]) -> Option<Sps> {
     match codec {
         VCodec::H264 => parse_h264_sps(nal),
         VCodec::Hevc => parse_hevc_sps(nal),
+        _ => None,
     }
 }
 

@@ -280,32 +280,38 @@ impl Analyzer {
                 let sets = match codec {
                     VCodec::H264 => nal::read_avcc(record),
                     VCodec::Hevc => nal::read_hvcc(record),
+                    _ => None,
                 };
                 self.stats.video.codec = Some(*codec);
                 self.stats.has_video = true;
-                if let Some((_, sps, pps)) = sets {
-                    if *codec == VCodec::Hevc {
-                        self.pps = pps.iter().filter_map(|p| nal::parse_hevc_pps(p)).collect();
-                    }
-                    if let Some(info) = sps.first().and_then(|s| nal::parse_sps(*codec, s)) {
-                        let changed = self.stats.video.sps.as_ref().is_some_and(|o| (o.width, o.height) != (info.width, info.height));
-                        if self.stats.video.sps.is_none() || changed {
-                            out.push(note(
-                                if changed { Level::Warn } else { Level::Info },
-                                "video-config",
-                                format!(
-                                    "{} {} level {}, {}x{}{}",
-                                    codec.name(),
-                                    info.profile,
-                                    info.level,
-                                    info.width,
-                                    info.height,
-                                    if changed { " (the resolution changed mid-stream)" } else { "" }
-                                ),
-                            ));
+                let info = match sets {
+                    Some((_, sps, pps)) => {
+                        if *codec == VCodec::Hevc {
+                            self.pps = pps.iter().filter_map(|p| nal::parse_hevc_pps(p)).collect();
                         }
-                        self.stats.video.sps = Some(info);
+                        sps.first().and_then(|s| nal::parse_sps(*codec, s))
                     }
+                    // AV1, VP9, VP8: the codec record says it (codecs agent: media::video_info)
+                    None => None,
+                };
+                if let Some(info) = info {
+                    let changed = self.stats.video.sps.as_ref().is_some_and(|o| (o.width, o.height) != (info.width, info.height));
+                    if self.stats.video.sps.is_none() || changed {
+                        out.push(note(
+                            if changed { Level::Warn } else { Level::Info },
+                            "video-config",
+                            format!(
+                                "{} {} level {}, {}x{}{}",
+                                codec.name(),
+                                info.profile,
+                                info.level,
+                                info.width,
+                                info.height,
+                                if changed { " (the resolution changed mid-stream)" } else { "" }
+                            ),
+                        ));
+                    }
+                    self.stats.video.sps = Some(info);
                 }
             }
             Media::AudioConfig { codec, config, sample_rate, channels } => {
