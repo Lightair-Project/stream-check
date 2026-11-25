@@ -1,9 +1,9 @@
 //! SRT link statistics of a session: what the SRT receiver saw on each connection (packets,
-//! gaps filled by retransmission, packets dropped too late, receive rate, the receive buffer), a
+//! gaps filled by retransmission, packets dropped too late, receive rate), a
 //! time series for graphs, and warnings when loss or drops pass a threshold.
 //!
 //! The SRT receiver (srt-protocol 0.4) doesn't count lost packets or measure the round trip after
-//! the handshake, so the lab derives them: a packet missing on first arrival is one that later
+//! the handshake (and its receive buffer's fill isn't reliable under loss), so the lab derives them: a packet missing on first arrival is one that later
 //! filled its gap (recovered) or was given up on (dropped); the round trip is the handshake's.
 
 use std::collections::VecDeque;
@@ -159,8 +159,6 @@ pub struct SrtSample {
     pub dropped: u64,
     /// Missing on first arrival, in percent of the second's packets.
     pub loss_pct: f64,
-    /// Media time waiting in the receive buffer, in ms.
-    pub buffer_ms: f64,
 }
 
 /// A session's SRT statistics, over all its SRT connections.
@@ -185,8 +183,6 @@ pub struct SrtStats {
     pub kbps: f64,
     pub peak_kbps: f64,
     pub pps: f64,
-    /// Media time waiting in the receive buffer, in ms; at most about the latency.
-    pub buffer_ms: f64,
     /// Loss is above `LOSS_WARN_PCT` right now.
     pub loss_warning: bool,
     /// Packets were dropped in the last `DROP_CLEAR_S` seconds.
@@ -240,7 +236,6 @@ impl SrtStats {
             self.connected = false;
             self.kbps = 0.0;
             self.pps = 0.0;
-            self.buffer_ms = 0.0;
         }
     }
 
@@ -256,7 +251,6 @@ impl SrtStats {
         self.total = self.earlier.add(now);
         self.loss_pct = self.total.loss_pct();
         self.drop_pct = self.total.drop_pct();
-        self.buffer_ms = s.rx_acknowledged_time.as_secs_f64() * 1000.0;
         let Some((t0, before)) = self.last.replace((t, now)) else { return out };
         let dt = t - t0;
         if dt <= 0.0 {
@@ -280,7 +274,6 @@ impl SrtStats {
             recovered: d.recovered,
             dropped: d.dropped,
             loss_pct: d.loss_pct(),
-            buffer_ms: self.buffer_ms,
         });
         if self.series.len() > MAX_SAMPLES {
             self.series.remove(0);

@@ -80,6 +80,15 @@ main{padding:16px 20px;display:grid;gap:16px}
 a{color:var(--accent)}
 h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:8px 0 0}
 .rej{padding:8px 14px;font-size:12.5px}
+.card.k-pull{border-left:3px solid var(--accent)}
+.card.k-file{border-left:3px solid #a879f0}
+.badge.kind{border-color:transparent;color:#fff;background:var(--accent)}
+.badge.kind.file{background:#a879f0}
+.src{padding:6px 14px;font-size:12px;color:var(--dim);border-bottom:1px solid var(--line);display:flex;gap:4px 14px;flex-wrap:wrap}
+.src b{color:var(--text);font-weight:500}
+.chip.info{border-color:var(--line);color:var(--dim)}
+.cc{padding:4px 14px 6px;font:12px/1.4 ui-monospace,Menlo,monospace;color:var(--text);border-top:1px solid var(--line)}
+.cc:before{content:"CC ";color:var(--dim)}
 .rej div{padding:2px 0}
 </style>
 </head>
@@ -177,6 +186,20 @@ async function sendFault(target, text) {
   await fetch(`/api/faults/${encodeURIComponent(target)}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 }
 
+/* ---------- codecs ---------- */
+// The codec's name from its WebCodecs codec string.
+function codecName(codec, hevc) {
+  const c = (codec || "").slice(0, 4);
+  return { avc1: "H.264", avc3: "H.264", hvc1: "HEVC", hev1: "HEVC", av01: "AV1", vp09: "VP9", vp8: "VP8" }[c] || (hevc ? "HEVC" : codec || "this codec");
+}
+// A decoder configuration: H.264, HEVC and AV1 take their codec record as the description; VP8 and VP9 take none.
+function decoderConfig(codec, desc, w, h) {
+  const cfg = { codec, codedWidth: w || undefined, codedHeight: h || undefined, optimizeForLatency: true };
+  if (desc && desc.length && !/^vp(8|09)/.test(codec)) cfg.description = desc;
+  return cfg;
+}
+const KIND_LABEL = { file: "file check", rtsp: "RTSP pull", ndi: "NDI", camera: "camera" };
+
 /* ---------- a stream card ---------- */
 function makeCard(s0) {
   const root = el("div", { class: "panel card" });
@@ -196,9 +219,12 @@ function makeCard(s0) {
   const stats = el("div", { class: "stats" },
     stat("video", "Video"), stat("res", "Resolution"), stat("fps", "Frame rate"), stat("vbr", "Video bitrate"), stat("key", "Keyframe interval"), stat("gop", "GOP"),
     stat("ts", "Timestamps"), stat("stall", "Stalls"), stat("av", "A/V offset"), stat("drift", "A/V drift"),
-    stat("audio", "Audio"), stat("loud", "Loudness (M / S / I)"), stat("sil", "Silence"), stat("rtp", "RTP (lost / repaired / late)"), stat("sess", "Session"));
+    stat("audio", "Audio"), stat("loud", "Loudness (M / S / I)"), stat("sil", "Silence"), stat("rtp", "RTP (lost / repaired / late)"),
+    stat("colour", "Colour"), stat("bits", "Bitstream"), stat("bpm", "Performance metrics (BPM)"), stat("lat", "Latency (sender clock)"), stat("cc", "Captions"),
+    stat("srtloss", "SRT loss (missing / recovered / dropped)"), stat("srtlat", "SRT latency · round trip"), stat("srtrx", "SRT receive"), stat("srtlink", "SRT link"),
+    stat("sess", "Session"));
   const viol = el("div", { class: "viol" });
-  const gcan = ["Bitrate kbps", "Frames per second", "Audio level dB"].map(l => { const c = el("canvas", { width: 300, height: 46 }); const v = el("span", {}, ""); return { c, v, wrap: el("div", {}, el("label", {}, l, v), c) }; });
+  const gcan = ["Bitrate kbps", "Frames per second", "Audio level dB", "SRT loss % · drops", "SRT receive kbps", "Latency ms (sender clock)"].map(l => { const c = el("canvas", { width: 300, height: 46 }); const v = el("span", {}, ""); return { c, v, wrap: el("div", {}, el("label", {}, l, v), c) }; });
   const graphs = el("div", { class: "graphs" }, ...gcan.map(g => g.wrap));
   const faults = el("div", { class: "faults" });
   const faultNow = el("span", { class: "now" });
@@ -210,7 +236,9 @@ function makeCard(s0) {
   // Enhanced RTMP multitrack (Twitch Dual Format): each track beyond the first, its own picture
   const tracksHead = el("div", { class: "th" });
   const tracksEl = el("div", { class: "tracks", style: "display:none" }, tracksHead);
-  root.append(head, pv, tracksEl, meters, stats, viol, graphs, faults, thumbs, log, links);
+  const src = el("div", { class: "src", style: "display:none" });
+  const ccLine = el("div", { class: "cc", style: "display:none" });
+  root.append(head, src, pv, tracksEl, meters, stats, ccLine, viol, graphs, faults, thumbs, log, links);
   const trackViews = new Map();
   function trackView(t) {
     const c = el("canvas", { width: 360, height: 640 });
@@ -225,9 +253,9 @@ function makeCard(s0) {
       const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
       const n = u8[2], codec = new TextDecoder().decode(u8.slice(3, 3 + n));
       const w = dv.getUint16(3 + n), h = dv.getUint16(5 + n), desc = u8.slice(7 + n);
-      const cfg = { codec, description: desc, codedWidth: w || undefined, codedHeight: h || undefined, optimizeForLatency: true };
+      const cfg = decoderConfig(codec, desc, w, h);
       let ok = false; try { ok = (await VideoDecoder.isConfigSupported(cfg)).supported; } catch { }
-      if (!ok) { say(`This browser can't decode ${codec}; the track's recording is in the links below.`); dec = null; return; }
+      if (!ok) { say(`This browser can't decode ${codecName(codec)} (${codec}); the track's recording is in the links below.`); dec = null; return; }
       if (dec && dec.state !== "closed") dec.close();
       const mine = new VideoDecoder({
         output: f => { if (c.width !== f.displayWidth) { c.width = f.displayWidth; c.height = f.displayHeight; } g.drawImage(f, 0, 0); f.close(); say(""); },
@@ -269,8 +297,10 @@ function makeCard(s0) {
         + ` · keyframe ${tv.keyint_last_s != null ? fmt(tv.keyint_last_s, 2) + " s" : "–"}${tv.b_frames ? " · B-frames" : ""}`
         + ` · keyframes aligned ${t.keyframes_aligned}, not ${t.keyframes_misaligned}`
         + (t.start_offset_ms != null ? ` · starts ${fmt(t.start_offset_ms, 0)} ms from track 0` : "")
-        + (tv.dts_backwards ? ` · ${tv.dts_backwards} timestamps backwards` : "");
-      cap.className = t.keyframes_misaligned || tv.dts_backwards ? "bad" : "";
+        + (tv.dts_backwards ? ` · ${tv.dts_backwards} timestamps backwards` : "")
+        + (tv.codec ? ` · ${String(tv.codec).toUpperCase()}` : "")
+        + (bpmText(tv.bpm) ? ` · BPM ${bpmText(tv.bpm)}` : (tv.bpm && tv.bpm.keyframes_checked && !tv.bpm.present ? " · no BPM" : ""));
+      cap.className = t.keyframes_misaligned || tv.dts_backwards || (tv.bpm && tv.bpm.keyframes_missing) ? "bad" : "";
     }
   }
 
@@ -291,9 +321,9 @@ function makeCard(s0) {
     const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
     const hevc = u8[1] === 1, n = u8[2], codec = new TextDecoder().decode(u8.slice(3, 3 + n));
     const w = dv.getUint16(3 + n), h = dv.getUint16(5 + n), desc = u8.slice(7 + n);
-    const cfg = { codec, description: desc, codedWidth: w || undefined, codedHeight: h || undefined, optimizeForLatency: true };
+    const cfg = decoderConfig(codec, desc, w, h);
     let ok = false; try { ok = (await VideoDecoder.isConfigSupported(cfg)).supported; } catch { }
-    if (!ok) { status(`This browser can't decode ${hevc ? "HEVC" : "H.264"} (${codec}); showing thumbnails.`); vdec = null; return; }
+    if (!ok) { status(`This browser can't decode ${codecName(codec, hevc)} (${codec}); showing thumbnails.`); vdec = null; return; }
     if (vdec && vdec.state !== "closed") vdec.close();
     const mine = new VideoDecoder({
       output: f => { if (canvas.width !== f.displayWidth) { canvas.width = f.displayWidth; canvas.height = f.displayHeight; } ctx2d.drawImage(f, 0, 0); f.close(); status(""); },
@@ -357,12 +387,108 @@ function makeCard(s0) {
     c.stroke();
   }
   function meter(m, db) { const pct = db == null ? 0 : Math.max(0, Math.min(100, (db + 60) / 60 * 100)); m.bar.style.width = pct + "%"; m.val.textContent = db == null ? "–" : fmt(db) + " dB"; }
-  function set(k, text, cls) { const n = stats.querySelector(`[data-k="${k}"]`); n.lastChild.textContent = text; n.className = "stat" + (cls ? " " + cls : ""); }
+  function set(k, text, cls, title) { const n = stats.querySelector(`[data-k="${k}"]`); n.lastChild.textContent = text; n.className = "stat" + (cls ? " " + cls : ""); n.style.display = ""; if (title != null) n.title = title; else n.removeAttribute("title"); }
+  function hide(...ks) { for (const k of ks) stats.querySelector(`[data-k="${k}"]`).style.display = "none"; }
+  // drops as red ticks from the bottom of a graph
+  function ticks(canvasEl, values) {
+    const c = canvasEl.getContext("2d"), w = canvasEl.width, h = canvasEl.height;
+    if (values.length < 2) return;
+    c.fillStyle = "#ef5350";
+    values.forEach((v, i) => { if (v > 0) { const x = i / (values.length - 1) * (w - 2) + 1; c.fillRect(x - 1, h - Math.min(h, 6 + v * 2), 2, Math.min(h, 6 + v * 2)); } });
+  }
+  function updateSrt(s) {
+    const x = s.srt;
+    gcan[3].wrap.style.display = gcan[4].wrap.style.display = x ? "" : "none";
+    if (!x) { hide("srtloss", "srtlat", "srtrx", "srtlink"); return; }
+    const t = x.total, l = x.link || {}, th = x.thresholds || {};
+    set("srtloss", `${t.missing} / ${t.recovered} / ${t.dropped} · ${fmt(x.loss_pct, 2)}%${x.connected ? ` (${fmt(x.window_loss_pct, 1)}% now)` : ""}`,
+      x.drop_warning ? "bad" : x.loss_warning ? "warn" : t.dropped ? "warn" : "",
+      `Packets missing on first arrival: ${t.missing} (${fmt(x.loss_pct, 2)}% of ${t.unique + t.missing}), of which ${t.recovered} filled their gap in time (retransmitted or reordered) and ${t.dropped} were dropped too late to play (${fmt(x.drop_pct, 2)}%).`
+      + ` Over the last ${th.window_s} s: ${fmt(x.window_loss_pct, 2)}% missing, ${x.window_dropped} dropped. Warns above ${th.loss_warn_pct}% loss and on any drop.`
+      + ` ${t.naks_sent} loss report(s) (NAK) sent.${t.fault_dropped ? ` ${t.fault_dropped} datagram(s) thrown away by the loss fault after SRT.` : ""}${t.decrypt_errors ? ` ${t.decrypt_errors} could not be decrypted.` : ""}`);
+    const rtt = l.handshake_rtt_ms, lat = l.latency_ms, tight = rtt != null && lat != null && lat < 4 * rtt;
+    set("srtlat", l.latency_ms != null ? `${lat} ms · ${fmt(rtt, 0)} ms` : "–", tight ? "warn" : "",
+      `Receive latency ${lat} ms agreed in the handshake (the lab asks for ${l.lab_latency_ms} ms; the larger of the two sides wins). Round trip ${fmt(rtt, 1)} ms, measured during the handshake.`
+      + (tight ? " The latency is under 4× the round trip: lost packets may not be retransmitted in time." : ""));
+    set("srtrx", x.connected ? `${fmt(x.kbps, 0)} kbps (peak ${fmt(x.peak_kbps, 0)}) · ${fmt(x.pps, 0)} pkt/s` : `closed · peak ${fmt(x.peak_kbps, 0)} kbps`, "",
+      "What arrives over SRT, retransmissions and SRT headers included.");
+    set("srtlink", `${x.connections > 1 ? x.connections + " connections · " : ""}${l.encryption_bits ? "AES-" + l.encryption_bits : "unencrypted"} · window ${l.flow_window_pkts ?? "–"} pkt`,
+      t.decrypt_errors ? "bad" : "",
+      `Flow window ${l.flow_window_pkts} packets, receive buffer ${l.recv_buffer_pkts} packets, packets up to ${l.max_packet_bytes} bytes, too-late packet drop ${l.too_late_drop ? "on" : "off"}. Stream id '${l.stream_id}' from ${l.remote}. ${t.packets} data packets received in all, ${t.clock_adjustments} clock adjustment(s).`);
+    const ser = x.series || [];
+    spark(gcan[3].c, ser.map(p => p.loss_pct), "#f0b429", 0, Math.max(5, ...ser.map(p => p.loss_pct || 0)) * 1.1); ticks(gcan[3].c, ser.map(p => p.dropped));
+    gcan[3].v.textContent = `${fmt(x.window_loss_pct, 1)}%${x.window_dropped ? " · " + x.window_dropped + " dropped" : ""}`;
+    spark(gcan[4].c, ser.map(p => p.kbps), "#4f9dff");
+    gcan[4].v.textContent = x.connected ? fmt(x.kbps, 0) : "–";
+  }
+  // What a file check or a pull reads from: the source's scalar facts, one line.
+  function updateSource(s) {
+    const o = s.source;
+    if (!o || typeof o !== "object" || !Object.keys(o).length) { src.style.display = "none"; return; }
+    const items = [];
+    for (const [k, val] of Object.entries(o)) {
+      if (val == null || val === "" || typeof val === "object") continue;
+      items.push(el("span", {}, k.replace(/_/g, " ") + " ", el("b", {}, typeof val === "number" ? (Number.isInteger(val) ? String(val) : fmt(val, 2)) : String(val))));
+    }
+    src.replaceChildren(...items.slice(0, 12)); src.style.display = items.length ? "" : "none";
+    src.title = JSON.stringify(o, null, 1).slice(0, 2000);
+  }
+  // A BPM summary: whether every keyframe carried all three messages.
+  function bpmText(b) {
+    if (!b || !b.present) return null;
+    const miss = b.keyframes_missing ? `missing on ${b.keyframes_missing} of ${b.keyframes_checked} keyframes${b.last_missing && b.last_missing.length ? " (last lacked " + b.last_missing.join(", ") + ")" : ""}` : `on all ${b.keyframes_checked} keyframes`;
+    return miss + (b.malformed ? ` · ${b.malformed} malformed` : "") + (b.after_slice ? ` · ${b.after_slice} after the slice` : "");
+  }
+  function updateBitstream(s) {
+    const v = s.stats.video, sps = v.sps, bs = v.bitstream, col = sps && sps.colour;
+    if (col) {
+      const names = [col.primaries_name, col.transfer_name, col.matrix_name].filter(Boolean);
+      const range = col.full_range == null ? "range not tagged" : col.full_range ? "full range" : "limited range";
+      const depth = sps.bit_depth_luma ? ` · ${sps.bit_depth_luma}-bit` : "";
+      set("colour", `${names.length ? [...new Set(names)].join(" / ") : "not tagged"} · ${range}${depth}`, bs && bs.colour_warnings && bs.colour_warnings.length ? "warn" : "",
+        `primaries ${col.primaries ?? "–"}, transfer ${col.transfer ?? "–"}, matrix ${col.matrix ?? "–"}${col.chroma_loc_top != null ? ", chroma location " + col.chroma_loc_top : ""}${sps.vui === false ? " (no VUI)" : ""}`);
+    } else hide("colour");
+    if (bs) {
+      const sei = Object.entries(bs.sei || {});
+      const bad = bs.bad_nal_lengths || bs.idr_not_marked;
+      set("bits", `IDR ${bs.idr} · I ${bs.pictures_i} / P ${bs.pictures_p} / B ${bs.pictures_b}${bs.sps_changes ? " · SPS changed " + bs.sps_changes + "×" : ""}`, bad ? "bad" : bs.sps_changes || bs.keyframes_not_idr ? "warn" : "",
+        [`${bs.keyframes_not_idr} keyframe(s) without an IDR, ${bs.idr_not_marked} IDR(s) not marked key, ${bs.bad_nal_lengths} picture(s) with bad NAL lengths`,
+         `in-band SPS on ${bs.inband_sps} picture(s), ${bs.inband_sps_differs} differing`,
+         sei.length ? "SEI: " + sei.map(([k, n]) => `${k} ×${n}`).join(", ") : "no SEI",
+         ...(bs.user_data || []).map(u => `user data ${u.uuid} ×${u.count}${u.text ? ": " + u.text : ""}`)].join("\n"));
+    } else hide("bits");
+    const bt = bpmText(v.bpm);
+    if (bt) {
+      const b = v.bpm, se = b.session, re = b.rendition;
+      set("bpm", bt, b.keyframes_missing || b.malformed ? "bad" : b.after_slice || b.off_keyframe || b.output_mismatches || b.time_backwards ? "warn" : "",
+        [`timestamp ${b.ts_messages}, session ${b.sm_messages}, rendition ${b.erm_messages} message(s); ${b.off_keyframe} off keyframes, ${b.time_backwards} time(s) going back`,
+         b.last_time ? `latest time ${b.last_time} (event ${b.last_event})` : "",
+         se ? `session (since the last keyframe): rendered ${se.rendered}, lagged ${se.lagged}, dropped ${se.dropped}, output ${se.output}` : "",
+         re ? `rendition: input ${re.input}, skipped ${re.skipped}, output ${re.output}; ${b.output_mismatches} mismatch(es) with the pictures that arrived` : ""].filter(Boolean).join("\n"));
+    } else hide("bpm");
+    const lt = v.latency;
+    if (lt && lt.samples) set("lat", `${fmt(lt.last_ms, 0)} ms (${fmt(lt.min_ms, 0)} / ${fmt(lt.avg_ms, 0)} / ${fmt(lt.max_ms, 0)})`, lt.last_ms > 2000 ? "warn" : "",
+      `Arrival time minus the sender's clock (${lt.source}), last (min / avg / max), over ${lt.samples} sample(s). Only meaningful when both clocks agree.`);
+    else hide("lat");
+    const cc = v.captions;
+    if (cc && cc.present) {
+      const parts = [...(cc.channels_608 || []), ...(cc.services_708 || []).map(n => "708 service " + n)];
+      set("cc", parts.length ? parts.join(", ") : `${cc.sei_messages} caption SEI`, "",
+        `${cc.sei_messages} caption SEI message(s); CEA-608 pairs field 1 ${cc.cea608_field1}, field 2 ${cc.cea608_field2}; ${cc.cea708_packets} CEA-708 packet(s)${cc.last_at_s != null ? "; latest at " + fmt(cc.last_at_s) + " s" : ""}`);
+      ccLine.textContent = cc.recent_text || ""; ccLine.style.display = cc.recent_text ? "" : "none";
+    } else { hide("cc"); ccLine.style.display = "none"; }
+    const ser = s.series || [], has = ser.some(p => p.latency_ms != null);
+    gcan[5].wrap.style.display = has ? "" : "none";
+    if (has) { spark(gcan[5].c, ser.map(p => p.latency_ms), "#a879f0"); gcan[5].v.textContent = lt && lt.last_ms != null ? fmt(lt.last_ms, 0) : "–"; }
+  }
   function update(s) {
     cardState = s;
     const st = s.stats, v = st.video, a = st.audio, lv = st.levels, sps = v.sps;
     const key = [s.id, s.state, s.connection && s.connection.protocol].join("|") + (s.state === "grace" ? "g" : "");
-    head.replaceChildren(el("span", { class: "badge" }, s.platform), el("span", { class: "key" }, s.key), el("span", { class: "pill " + s.state }, s.state === "grace" ? `waiting ${fmt(s.grace_left_s, 0)} s` : s.state),
+    const kind = s.kind || "ingest", proto = s.connection ? s.connection.protocol : (s.protocols || [])[0];
+    root.classList.toggle("k-pull", kind === "pull"); root.classList.toggle("k-file", kind === "file");
+    const kindBadge = kind !== "ingest" ? el("span", { class: "badge kind " + kind }, KIND_LABEL[proto] || kind) : "";
+    head.replaceChildren(kindBadge, el("span", { class: "badge" }, s.platform), el("span", { class: "key" }, s.key), el("span", { class: "pill " + s.state }, s.state === "grace" ? `waiting ${fmt(s.grace_left_s, 0)} s` : s.state),
       el("span", { class: "dim" }, `${(s.protocols || []).join("+").toUpperCase()}${s.connection ? " from " + s.connection.remote : ""} · ${dur(s.duration_s)}`),
       el("span", { style: "flex:1" }), s.state !== "ended" ? el("button", { class: "danger", onclick: () => fetch(`/api/sessions/${encodeURIComponent(s.id)}/end`, { method: "POST" }) }, "End") : "");
     root.classList.toggle("ended", s.state === "ended");
@@ -384,13 +510,18 @@ function makeCard(s0) {
     set("loud", lv.available ? `${fmt(lv.momentary_lufs)} / ${fmt(lv.short_term_lufs)} / ${fmt(lv.integrated_lufs)} LUFS` : "needs ffmpeg");
     set("sil", lv.silent ? "SILENT now" : lv.silence_events ? `${lv.silence_events} time(s), ${fmt(lv.silence_total_s, 0)} s` : "none", lv.silent ? "bad" : lv.silence_events ? "warn" : "");
     const rtp = st.rtp; const rl = rtp.video.lost + rtp.audio.lost, rr = rtp.video.recovered + rtp.audio.recovered, rt = rtp.video.late + rtp.audio.late;
-    set("rtp", rtp.active ? `${rl} / ${rr} / ${rt}${rtp.video.pictures_dropped ? " · " + rtp.video.pictures_dropped + " picture(s) dropped" : ""}` : "n/a (not WebRTC)", rl || rt ? "warn" : "");
+    if (rtp.active) set("rtp", `${rl} / ${rr} / ${rt}${rtp.video.pictures_dropped ? " · " + rtp.video.pictures_dropped + " picture(s) dropped" : ""}`, rl || rt ? "warn" : ""); else hide("rtp");
+    updateSrt(s);
     set("sess", `${s.reconnects} reconnect(s), grace used ${s.grace_uses}× (${s.grace_s} s)`);
     updateTracks(s);
+    updateSource(s);
+    updateBitstream(s);
     meter(mL, lv.peak_l_db); meter(mR, lv.peak_r_db);
     lufs.textContent = lv.available ? `momentary ${fmt(lv.momentary_lufs)} LUFS · integrated ${fmt(lv.integrated_lufs)} LUFS · max peak ${fmt(lv.max_peak_db)} dBFS${lv.clipped_blocks ? " · CLIPPING" : ""}` : "levels need ffmpeg on this machine";
-    viol.replaceChildren(...s.violations.map(x => el("span", { class: "chip " + (x.active ? (x.level === "warn" ? "warn" : "") : "cleared"), title: x.msg }, `${x.rule}${x.count > 1 ? " ×" + x.count : ""}: ${x.msg}`)));
-    viol.style.display = s.violations.length ? "" : "none";
+    const bs = v.bitstream || {}, extra = [...(bs.level_warnings || []).map(m => ["level", m]), ...(bs.colour_warnings || []).map(m => ["colour", m])];
+    viol.replaceChildren(...s.violations.map(x => el("span", { class: "chip " + (x.active ? (x.level === "warn" ? "warn" : "") : "cleared"), title: x.msg }, `${x.rule}${x.count > 1 ? " ×" + x.count : ""}: ${x.msg}`)),
+      ...extra.map(([k, m]) => el("span", { class: "chip warn", title: m }, `${k}: ${m}`)));
+    viol.style.display = s.violations.length || extra.length ? "" : "none";
     const ser = s.series;
     spark(gcan[0].c, ser.map(p => p.video_kbps + p.audio_kbps), "#4f9dff"); gcan[0].v.textContent = fmt(v.kbps + a.kbps, 0);
     spark(gcan[1].c, ser.map(p => p.fps), "#38c172"); gcan[1].v.textContent = fmt(v.fps_arrival);
