@@ -87,6 +87,21 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim)
 .src{padding:6px 14px;font-size:12px;color:var(--dim);border-bottom:1px solid var(--line);display:flex;gap:4px 14px;flex-wrap:wrap}
 .src b{color:var(--text);font-weight:500}
 .chip.info{border-color:var(--line);color:var(--dim)}
+.srclist{padding:4px 14px 8px;font-size:12px;border-bottom:1px solid var(--line);display:grid;gap:2px}
+.srclist table{border-collapse:collapse;font-variant-numeric:tabular-nums;margin:2px 0}
+.srclist th{font-weight:500;color:var(--dim);text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.04em}
+.srclist td,.srclist th{padding:1px 10px 1px 0;white-space:nowrap}
+.srclist td.bad{color:var(--bad)}.srclist td.warn{color:var(--warn)}
+.srclist .bad{color:var(--bad)}.srclist .warn{color:var(--warn)}
+.swatch{display:inline-block;width:10px;height:10px;border-radius:2px;border:1px solid var(--line);vertical-align:-1px;margin-right:4px}
+.reads{padding:12px 16px;display:none;gap:10px}
+.reads.open{display:grid}
+.reads .row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.reads input,.reads select{font:inherit;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:4px 8px}
+.reads input[type=text]{flex:1;min-width:240px}
+.reads .lbl{width:90px;color:var(--dim)}
+.reads .out{font-size:12.5px;color:var(--dim)}
+.reads .out.bad{color:var(--bad)}
 .cc{padding:4px 14px 6px;font:12px/1.4 ui-monospace,Menlo,monospace;color:var(--text);border-top:1px solid var(--line)}
 .cc:before{content:"CC ";color:var(--dim)}
 .rej div{padding:2px 0}
@@ -98,10 +113,17 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim)
   <span class="dim" id="sub">connecting…</span>
   <span class="sp"></span>
   <button id="btn-connect">Connect a sender</button>
+  <button id="btn-reads" title="Check a recording, or pull from an RTSP server, an NDI source or a camera">Check a file or pull…</button>
   <button id="btn-faultall" title="Faults for every stream">Faults for all…</button>
 </header>
 <main>
   <section class="panel connect" id="connect"></section>
+  <section class="panel reads" id="reads">
+    <div class="row"><span class="lbl">File</span><input type="text" id="r-path" placeholder="/Users/me/Movies/recording.mp4 (a path on the lab's computer)"><select class="r-prof" id="r-fprof"></select><button id="r-check">Check file</button></div>
+    <div class="row"><span class="lbl">Pull</span><input type="text" id="r-url" placeholder="rtsp://host:8554/live · ndi://MACHINE (Source) · camera://Name"><input type="number" id="r-for" min="1" placeholder="for s" style="width:80px"><select class="r-prof" id="r-pprof"></select><button id="r-pull">Pull</button></div>
+    <div class="row"><span class="lbl">Sources</span><button id="r-ndi">List NDI sources</button><button id="r-cam">List cameras</button><span id="r-list" class="row"></span></div>
+    <div class="out" id="r-out"></div>
+  </section>
   <section id="live"></section>
   <section id="earlier"></section>
   <section id="rejections"></section>
@@ -177,6 +199,42 @@ function renderConnect() {
   box.append(hostRow, platRow, protoRow, el("div", { class: "body" }, el("img", { alt: "QR code", src: `/api/qr?text=${encodeURIComponent(urlFor)}` }), urls));
 }
 $("#btn-connect").onclick = () => $("#connect").classList.toggle("open");
+$("#btn-reads").onclick = async () => {
+  const box = $("#reads"); box.classList.toggle("open");
+  if (box.dataset.loaded) return; box.dataset.loaded = "1";
+  try {
+    const profs = await (await fetch("/api/profiles")).json();
+    for (const sel of document.querySelectorAll(".r-prof")) sel.replaceChildren(...profs.map(p => el("option", { value: p.name }, p.name)));
+    for (const sel of document.querySelectorAll(".r-prof")) sel.value = "open";
+  } catch { }
+};
+async function startRead(url, body) {
+  const out = $("#r-out"); out.className = "out"; out.textContent = "starting…";
+  try {
+    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.ok === false) { out.className = "out bad"; out.textContent = j.error || j.msg || `failed (${r.status})`; return; }
+    out.textContent = `started: ${j.key || ""} (${j.id})`;
+  } catch (e) { out.className = "out bad"; out.textContent = String(e); }
+}
+$("#r-check").onclick = () => { const path = $("#r-path").value.trim(); if (path) startRead("/api/check-file", { path, profile: $("#r-fprof").value || "open" }); };
+$("#r-pull").onclick = () => {
+  const url = $("#r-url").value.trim(); if (!url) return;
+  const f = parseFloat($("#r-for").value);
+  startRead("/api/pull", { url, profile: $("#r-pprof").value || "open", ...(f > 0 ? { for_s: f } : {}) });
+};
+async function listSources(kind) {
+  const list = $("#r-list"), scheme = kind === "ndi" ? "ndi://" : "camera://";
+  list.replaceChildren(el("span", { class: "dim" }, kind === "ndi" ? "looking for NDI sources (3 s)…" : "listing cameras…"));
+  try {
+    const j = await (await fetch(`/api/sources/${kind}`)).json();
+    if (!j.available) { list.replaceChildren(el("span", { class: "dim" }, j.error || "not available")); return; }
+    if (!j.sources.length) { list.replaceChildren(el("span", { class: "dim" }, "none found")); return; }
+    list.replaceChildren(...j.sources.map(n => el("button", { title: "Use this source", onclick: () => { $("#r-url").value = scheme + n; } }, n)));
+  } catch (e) { list.replaceChildren(el("span", { class: "dim" }, String(e))); }
+}
+$("#r-ndi").onclick = () => listSources("ndi");
+$("#r-cam").onclick = () => listSources("camera");
 $("#btn-faultall").onclick = () => { const w = prompt("Fault for every stream: drop, refuse 10, freeze 10, throttle 500, latency 300, loss 5, clear", "refuse 10"); if (w) sendFault("*", w); };
 
 async function sendFault(target, text) {
@@ -237,8 +295,9 @@ function makeCard(s0) {
   const tracksHead = el("div", { class: "th" });
   const tracksEl = el("div", { class: "tracks", style: "display:none" }, tracksHead);
   const src = el("div", { class: "src", style: "display:none" });
+  const srcList = el("div", { class: "srclist", style: "display:none" });
   const ccLine = el("div", { class: "cc", style: "display:none" });
-  root.append(head, src, pv, tracksEl, meters, stats, ccLine, viol, graphs, faults, thumbs, log, links);
+  root.append(head, src, srcList, pv, tracksEl, meters, stats, ccLine, viol, graphs, faults, thumbs, log, links);
   const trackViews = new Map();
   function trackView(t) {
     const c = el("canvas", { width: 360, height: 640 });
@@ -308,7 +367,11 @@ function makeCard(s0) {
   let ws = null, vdec = null, adec = null, gotKey = false, acfg = null, nextT = 0, destroyed = false, vcfgDone = false;
   const ctx2d = canvas.getContext("2d");
   const status = t => { msg.textContent = t; msg.style.display = t ? "" : "none"; };
+  // files are read faster than they play, and NDI and cameras send no compressed picture: thumbnails only
+  const proto0 = s0.connection ? s0.connection.protocol : (s0.protocols || [])[0];
+  const noPreview = s0.kind === "file" || proto0 === "ndi" || proto0 === "camera";
   function open() {
+    if (noPreview) { if (!cardState.thumbs.length) status(s0.kind === "file" ? "a file check: thumbnails below as the file is read" : "no compressed picture to preview: thumbnails below"); muteBtn.style.display = "none"; return; }
     if (!("VideoDecoder" in window)) { status("This browser can't decode video (WebCodecs); showing thumbnails."); return; }
     ws = new WebSocket(`ws://${location.host}/ws/preview/${encodeURIComponent(s0.id)}`);
     ws.binaryType = "arraybuffer";
@@ -421,17 +484,70 @@ function makeCard(s0) {
     spark(gcan[4].c, ser.map(p => p.kbps), "#4f9dff");
     gcan[4].v.textContent = x.connected ? fmt(x.kbps, 0) : "–";
   }
-  // What a file check or a pull reads from: the source's scalar facts, one line.
+  // What a file check or a pull reads from: its main facts on one line, its tracks and problems below.
   function updateSource(s) {
     const o = s.source;
-    if (!o || typeof o !== "object" || !Object.keys(o).length) { src.style.display = "none"; return; }
-    const items = [];
-    for (const [k, val] of Object.entries(o)) {
-      if (val == null || val === "" || typeof val === "object") continue;
-      items.push(el("span", {}, k.replace(/_/g, " ") + " ", el("b", {}, typeof val === "number" ? (Number.isInteger(val) ? String(val) : fmt(val, 2)) : String(val))));
+    if (!o || typeof o !== "object" || !Object.keys(o).length) { src.style.display = srcList.style.display = "none"; return; }
+    const items = [], rows = [];
+    const fact = (k, val) => { if (val != null && val !== "") items.push(el("span", {}, k + " ", el("b", {}, String(val)))); };
+    const row = (text, cls) => rows.push(el("div", { class: cls || "" }, text));
+    const k = o.kind;
+    if (k === "file") {
+      fact("file", o.path);
+      fact("format", o.format_long || o.format);
+      if (o.bytes != null) fact("size", `${(o.bytes / 1e6).toFixed(1)} MB`);
+      if (o.duration_s != null) fact("lasts", `${fmt(o.duration_s, 2)} s`);
+      if (o.average_kbps != null) fact("average", `${fmt(o.average_kbps, 0)} kbps`);
+      const c = o.container;
+      if (c && c.layout) fact("layout", `${c.layout}${c.moov_before_mdat ? ", index first" : ""}${c.fragments ? ", " + c.fragments + " fragments" : ""}${c.brand ? " (" + c.brand + ")" : ""}`);
+      if (o.av_start_offset_ms != null) fact("sound starts", `${fmt(o.av_start_offset_ms, 0)} ms after the picture`);
+      if (o.video_duration_s != null && o.audio_duration_s != null) fact("picture / sound", `${fmt(o.video_duration_s, 2)} / ${fmt(o.audio_duration_s, 2)} s`);
+      if (c && c.boxes) row("boxes: " + c.boxes);
+      if (o.chapters && o.chapters.length) row("chapters: " + o.chapters.map(x => `${dur(x.start_s)} ${x.title || ""}`.trim()).join(" · "));
+      for (const p of (c && c.problems) || []) row("container: " + p, "bad");
+      if (o.ffprobe_error) row("ffprobe: " + o.ffprobe_error, "bad");
+      for (const p of o.ffprobe_errors || []) row("ffprobe: " + p, "warn");
+      for (const t of o.video_tracks || []) {
+        const m = t.measured || {};
+        row(`picture #${t.index}: ${t.codec || "?"}${t.profile ? " " + t.profile : ""} ${t.width || "?"}×${t.height || "?"} · ${fmt(m.fps)} fps · ${fmt(m.kbps, 0)} kbps${t.duration_s != null ? " · " + fmt(t.duration_s, 2) + " s" : ""}${t.title ? " · “" + t.title + "”" : ""}`);
+      }
+      if ((o.audio_tracks || []).length) {
+        const td = (x, cls) => el("td", cls ? { class: cls } : {}, x == null ? "–" : String(x));
+        const tb = el("table", {}, el("tr", {}, ...["sound", "codec", "rate", "ch", "title", "kbps", "LUFS (I)", "max peak", "silence"].map(h => el("th", {}, h))));
+        for (const t of o.audio_tracks) {
+          const m = t.measured || {}, l = t.levels || {};
+          const quiet = l.integrated_lufs != null && l.integrated_lufs < -50;
+          tb.append(el("tr", {}, td("#" + t.index), td(t.codec), td(t.sample_rate), td(t.channels), td([t.title, t.language].filter(x => x && x !== "und").join(" · ") || null),
+            td(m.kbps != null ? fmt(m.kbps, 0) : null), td(l.integrated_lufs != null ? fmt(l.integrated_lufs) : null, quiet ? "warn" : ""),
+            td(l.max_peak_db != null ? fmt(l.max_peak_db) + " dBFS" : null, l.max_peak_db > -0.1 ? "warn" : ""),
+            td(l.silence_events ? `${l.silence_events}×, ${fmt(l.silence_total_s, 0)} s` : (l.available === false ? null : "none"), l.silence_events ? "warn" : "")));
+        }
+        rows.push(tb);
+      }
+    } else if (k === "rtsp") {
+      fact("from", o.url); fact("server", o.server); fact("transport", o.transport); fact("timing", o.timing);
+      if (o.session_timeout_s != null) fact("session timeout", `${o.session_timeout_s} s`);
+      for (const t of o.tracks || []) row(`${t.media} track: ${t.codec}/${t.clock_rate}${t.channels ? "/" + t.channels : ""} (payload ${t.payload_type}, channel ${Array.isArray(t.channel) ? t.channel.join("-") : t.channel})`);
+      for (const t of o.skipped || []) row(`skipped: ${typeof t === "string" ? t : JSON.stringify(t)}`, "warn");
+    } else {
+      fact(k === "ndi" ? "NDI source" : k === "camera" ? "camera" : "source", o.name || o.url);
+      const v = o.video;
+      if (v) fact("picture", `${v.width}×${v.height} ${v.fourcc || ""} ${v.frame_rate || ""}${v.progressive === false ? " interlaced" : ""}`);
+      if (o.asked) fact("asked", `${o.asked.size || "any size"} @ ${o.asked.fps ?? "?"} fps`);
+      if (o.declared_fps != null) fact("camera says", `${fmt(o.declared_fps, 2)} fps`);
+      if (o.audio) fact("sound", `${o.audio.sample_rate} Hz · ${o.audio.channels} ch`);
+      const p = o.picture;
+      if (p && p.frames) {
+        const [r, g, b] = (p.mean_rgb || [0, 0, 0]).map(x => Math.round(x));
+        rows.push(el("div", { class: p.black_now ? "bad" : p.frozen_now ? "warn" : "" }, el("span", { class: "swatch", style: `background:rgb(${r},${g},${b})` }),
+          `picture: ${p.black_now ? "BLACK now" : p.frozen_now ? "FROZEN now" : "changing"} · mean ${p.mean_colour || ""} · brightness ${fmt(p.mean_luma, 0)} (± ${fmt(p.luma_stdev, 0)}) · black ${p.black_frames} frame(s), ${fmt(p.black_s, 1)} s · frozen ${p.frozen_events}×, longest ${fmt(p.longest_frozen_s, 1)} s`
+          + (o.picture_never_changed ? " · never changed" : "")));
+      }
     }
+    if (!items.length) for (const [key, val] of Object.entries(o)) if (val != null && val !== "" && typeof val !== "object") fact(key.replace(/_/g, " "), val);
     src.replaceChildren(...items.slice(0, 12)); src.style.display = items.length ? "" : "none";
-    src.title = JSON.stringify(o, null, 1).slice(0, 2000);
+    src.title = JSON.stringify(o, null, 1).slice(0, 3000);
+    srcList.replaceChildren(...rows); srcList.style.display = rows.length ? "" : "none";
   }
   // A BPM summary: whether every keyframe carried all three messages.
   function bpmText(b) {
@@ -441,6 +557,8 @@ function makeCard(s0) {
   }
   function updateBitstream(s) {
     const v = s.stats.video, sps = v.sps, bs = v.bitstream, col = sps && sps.colour;
+    // an uncompressed picture (NDI, cameras) has no bitstream to read
+    if (sps && !v.codec) { hide("colour", "bits", "enc", "bpm", "cc", "lat"); ccLine.style.display = "none"; gcan[5].wrap.style.display = "none"; return; }
     if (col) {
       const names = [col.primaries_name, col.transfer_name, col.matrix_name].filter(Boolean);
       const range = col.full_range == null ? (names.length ? "range not tagged" : "") : col.full_range ? "full range" : "limited range";
@@ -495,17 +613,21 @@ function makeCard(s0) {
     const kindBadge = kind !== "ingest" ? el("span", { class: "badge kind " + kind }, KIND_LABEL[proto] || kind) : "";
     head.replaceChildren(kindBadge, el("span", { class: "badge" }, s.platform), el("span", { class: "key" }, s.key), el("span", { class: "pill " + s.state }, s.state === "grace" ? `waiting ${fmt(s.grace_left_s, 0)} s` : s.state),
       el("span", { class: "dim" }, `${(s.protocols || []).join("+").toUpperCase()}${s.connection ? " from " + s.connection.remote : ""} · ${dur(s.duration_s)}`),
-      el("span", { style: "flex:1" }), s.state !== "ended" ? el("button", { class: "danger", onclick: () => fetch(`/api/sessions/${encodeURIComponent(s.id)}/end`, { method: "POST" }) }, "End") : "");
+      el("span", { style: "flex:1" }), s.state !== "ended" ? el("button", { class: "danger", onclick: () => fetch(`/api/sessions/${encodeURIComponent(s.id)}/end`, { method: "POST" }) }, kind === "ingest" ? "End" : "Stop") : "");
     root.classList.toggle("ended", s.state === "ended");
+    if (noPreview) tools.style.display = "none";
     still.style.display = vdec ? "none" : (s.thumbs.length ? "" : "none");
     if (!vdec && s.thumbs.length) { still.src = `/media/${encodeURIComponent(s.id)}/thumbs/${s.thumbs[s.thumbs.length - 1].file}`; canvas.style.display = "none"; msg.style.display = "none"; } else canvas.style.display = "";
     if (s.state === "ended" && !vdec) { if (!s.thumbs.length) status("session ended"); }
-    set("video", sps ? `${v.codec ? v.codec.toUpperCase() : ""} ${sps.profile} @ ${sps.level}` : "–");
+    if (sps && !v.codec) set("video", `uncompressed ${sps.width}×${sps.height}, ${fmt(v.fps)} fps${sps.declared_fps ? " / " + fmt(sps.declared_fps) + " declared" : ""}`, "", sps.profile);
+    else set("video", sps ? `${v.codec ? v.codec.toUpperCase() : ""} ${sps.profile} @ ${sps.level}` : "–");
     set("res", sps ? `${sps.width}×${sps.height}${sps.interlaced ? " interlaced" : ""}` : "–", sps && sps.interlaced ? "warn" : "");
     set("fps", v.fps ? `${fmt(v.fps)}${sps && sps.declared_fps ? " (declares " + fmt(sps.declared_fps) + ")" : ""}` : "–");
     set("vbr", v.kbps ? `${fmt(v.kbps, 0)} kbps (peak ${fmt(v.peak_kbps, 0)})` : "–");
     set("key", v.keyint_last_s != null ? `${fmt(v.keyint_last_s, 2)} s (min ${fmt(v.keyint_min_s, 2)}, max ${fmt(v.keyint_max_s, 2)})` : (v.since_key_s != null ? `first, ${fmt(v.since_key_s, 1)} s in` : "–"), v.keyint_max_s > 4 ? "warn" : "");
+    if (sps && !v.codec) hide("key");
     set("gop", v.gop_frames ? `${v.gop_frames} frames: ${v.gop_pattern}${v.b_frames ? " · B-frames" : ""}` : "–");
+    if (sps && !v.codec) hide("gop");
     const tsBad = v.dts_backwards + a.pts_backwards; const gaps = v.gaps + a.gaps;
     set("ts", tsBad ? `${tsBad} backwards` : gaps ? `${gaps} gap(s), max ${fmt(Math.max(v.max_gap_ms, a.max_gap_ms), 0)} ms` : "monotonic", tsBad ? "bad" : gaps ? "warn" : "");
     set("stall", st.stalls.count ? `${st.stalls.count} · longest ${fmt(st.stalls.longest_ms, 0)} ms${st.stalls.stalled_now ? " · NOW" : ""}` : (st.stalls.stalled_now ? "stalled now" : "none"), st.stalls.stalled_now ? "bad" : st.stalls.count ? "warn" : "");
@@ -515,7 +637,8 @@ function makeCard(s0) {
     set("loud", lv.available ? `${fmt(lv.momentary_lufs)} / ${fmt(lv.short_term_lufs)} / ${fmt(lv.integrated_lufs)} LUFS` : "needs ffmpeg");
     set("sil", lv.silent ? "SILENT now" : lv.silence_events ? `${lv.silence_events} time(s), ${fmt(lv.silence_total_s, 0)} s` : "none", lv.silent ? "bad" : lv.silence_events ? "warn" : "");
     const rtp = st.rtp; const rl = rtp.video.lost + rtp.audio.lost, rr = rtp.video.recovered + rtp.audio.recovered, rt = rtp.video.late + rtp.audio.late;
-    if (rtp.active) set("rtp", `${rl} / ${rr} / ${rt}${rtp.video.pictures_dropped ? " · " + rtp.video.pictures_dropped + " picture(s) dropped" : ""}`, rl || rt ? "warn" : ""); else hide("rtp");
+    const rtpLine = (n, x) => `${n}: ${x.received} received, ${x.lost} lost, ${x.recovered} recovered, ${x.late} late, ${x.duplicates} duplicate(s), reordered up to ${x.max_reorder}${n === "video" ? `, ${x.pictures} picture(s), ${x.pictures_dropped} dropped` : ""}`;
+    if (rtp.active) set("rtp", `${rl} / ${rr} / ${rt}${rtp.video.pictures_dropped ? " · " + rtp.video.pictures_dropped + " picture(s) dropped" : ""}`, rl || rt ? "warn" : "", rtpLine("video", rtp.video) + "\n" + rtpLine("audio", rtp.audio)); else hide("rtp");
     updateSrt(s);
     set("sess", `${s.reconnects} reconnect(s), grace used ${s.grace_uses}× (${s.grace_s} s)`);
     updateTracks(s);
@@ -535,7 +658,9 @@ function makeCard(s0) {
     if (f.refuse_left_s) act.push(`refusing ${fmt(f.refuse_left_s, 0)} s`); if (f.freeze_left_s) act.push(`frozen ${fmt(f.freeze_left_s, 0)} s`);
     if (f.throttle_kbps) act.push(`throttle ${f.throttle_kbps} kbps`); if (f.latency_ms) act.push(`+${f.latency_ms} ms`); if (f.loss_pct) act.push(`${f.loss_pct}% loss`);
     faultNow.textContent = act.length ? "active: " + act.join(", ") : "";
-    faults.style.display = s.state === "ended" ? "none" : "";
+    // a file has nothing to fault; a pull takes drop, freeze and throttle (its reading)
+    faults.style.display = s.state === "ended" || kind === "file" || (kind === "pull" && proto !== "rtsp") ? "none" : "";
+    for (const b of faults.querySelectorAll("button")) b.style.display = kind === "pull" && !/^(Drop|Freeze|Throttle|Clear)/.test(b.textContent) ? "none" : "";
     if (thumbN !== s.thumbs.length) { thumbN = s.thumbs.length; thumbs.replaceChildren(...s.thumbs.map(t => el("figure", {}, el("img", { loading: "lazy", src: `/media/${encodeURIComponent(s.id)}/thumbs/${t.file}` }), el("figcaption", {}, dur(t.t))))); thumbs.scrollLeft = thumbs.scrollWidth; }
     thumbs.style.display = s.thumbs.length ? "" : "none";
     if (logN !== s.events_total || s.state !== headKey) {
