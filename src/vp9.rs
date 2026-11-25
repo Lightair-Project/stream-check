@@ -202,7 +202,9 @@ pub fn info(vp8: bool, record: &[u8]) -> Option<Sps> {
     let n = record.len();
     let width = u16::from_be_bytes([record[n - 4], record[n - 3]]) as u32;
     let height = u16::from_be_bytes([record[n - 2], record[n - 1]]) as u32;
-    let [profile, level, depth, chroma, ..] = read_vpcc(record_vpcc(record))?;
+    let [profile, level, depth, chroma, range, cp, tc, mc] = read_vpcc(record_vpcc(record))?;
+    // 2 everywhere is "unspecified": the sender didn't describe its colour
+    let described = (cp, tc, mc) != (2, 2, 2);
     let codec_string = if vp8 { "vp8".to_string() } else { format!("vp09.{profile:02}.{level:02}.{depth:02}") };
     Some(Sps {
         profile: if vp8 { format!("version {profile}") } else { format!("Profile {profile}") },
@@ -217,6 +219,18 @@ pub fn info(vp8: bool, record: &[u8]) -> Option<Sps> {
             _ => 3,
         },
         bit_depth: depth,
+        bit_depth_chroma: depth,
+        vui: described,
+        colour: crate::av1::colour(
+            range == 1,
+            described.then_some((cp, tc, mc)),
+            // 4:2:0 vertical (H.273 location 0) or co-located (location 2)
+            match chroma {
+                0 => Some(0),
+                1 => Some(2),
+                _ => None,
+            },
+        ),
         declared_fps: None,
         max_reorder: Some(0),
         interlaced: false,

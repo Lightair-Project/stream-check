@@ -3,7 +3,7 @@
 //! configuration record (av1C) is read and made here too. Written for measuring a stream, not
 //! decoding it.
 
-use crate::nal::{Bits, Sps};
+use crate::nal::{self, Bits, Colour, Sps};
 
 pub const OBU_SEQUENCE_HEADER: u8 = 1;
 pub const OBU_TEMPORAL_DELIMITER: u8 = 2;
@@ -116,6 +116,8 @@ pub struct SeqHeader {
     pub subsampling_x: bool,
     pub subsampling_y: bool,
     pub chroma_sample_position: u8,
+    /// Whether the colour description (primaries, transfer, matrix) was sent.
+    pub colour_described: bool,
     pub color_primaries: u8,
     pub transfer: u8,
     pub matrix: u8,
@@ -219,7 +221,8 @@ pub fn parse_seq_header(p: &[u8]) -> Option<SeqHeader> {
     };
     s.mono = if s.profile == 1 { false } else { b.flag()? };
     let (mut cp, mut tc, mut mc) = (2, 2, 2);
-    if b.flag()? {
+    s.colour_described = b.flag()?;
+    if s.colour_described {
         cp = b.u(8)? as u8;
         tc = b.u(8)? as u8;
         mc = b.u(8)? as u8;
@@ -337,11 +340,45 @@ pub fn info(s: &SeqHeader) -> Sps {
             }
         },
         bit_depth: s.bit_depth,
+        bit_depth_chroma: s.bit_depth,
+        high_tier: s.tier == 1,
+        vui: s.colour_described,
+        colour: colour(
+            s.full_range,
+            s.colour_described.then_some((s.color_primaries, s.transfer, s.matrix)),
+            // chroma_sample_position: 1 vertical (H.273 location 0), 2 co-located (location 2)
+            match s.chroma_sample_position {
+                1 => Some(0),
+                2 => Some(2),
+                _ => None,
+            },
+        ),
         declared_fps: s.fps,
         // a temporal unit is decoded and shown in the same order
         max_reorder: Some(0),
         interlaced: false,
         codec_string: codec_string(s),
+        ..Default::default()
+    }
+}
+
+/// Colour tags as the stats show them: the range (always known for AV1 and VP9), the H.273
+/// primaries, transfer and matrix when the stream describes them, and the chroma location.
+pub fn colour(full_range: bool, described: Option<(u8, u8, u8)>, chroma_loc: Option<u32>) -> Colour {
+    let (primaries, transfer, matrix) = match described {
+        Some((p, t, m)) => (Some(p), Some(t), Some(m)),
+        None => (None, None, None),
+    };
+    Colour {
+        full_range: Some(full_range),
+        primaries,
+        transfer,
+        matrix,
+        primaries_name: primaries.map(|c| nal::primaries_name(c).into()),
+        transfer_name: transfer.map(|c| nal::transfer_name(c).into()),
+        matrix_name: matrix.map(|c| nal::matrix_name(c).into()),
+        chroma_loc_top: chroma_loc,
+        chroma_loc_bottom: chroma_loc,
         ..Default::default()
     }
 }
