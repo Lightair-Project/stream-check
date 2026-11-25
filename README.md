@@ -146,7 +146,10 @@ as classic FLV tags:
 - **audio:** the same with `Multitrack` audio; classic AAC is track 0.
 - **per track:** every track beyond the first is analysed on its own (codec, profile, size, frame rate,
   bitrate average and peak, keyframe interval, B-frames, timestamps) and recorded as its own playable file,
-  `segNN-trackN.mkv`, beside the main recording. The report's `tracks` lists them, with `total_video_kbps`.
+  `segNN-trackN.mkv`, beside the main recording. An audio track beyond the first (Twitch's VOD track, say) is
+  measured like the main sound, on its own: codec, rate, channels, bitrate, timestamps, and its loudness, peaks
+  and silence decoded by its own ffmpeg (`tracks.tracks[].audio` and `.levels`); it is recorded as
+  `segNN-trackN-audio.mkv` (`.audio_recording`). The report's `tracks` lists them, with `total_video_kbps`.
 - **across tracks:** each track's keyframes are held against track 0's (aligned within one frame of the slower
   track), its start against track 0's (one timestamp base, within 1 s), and its timestamps must rise.
 - **the key:** the stream name's query is reported by parameter name only (`client.key_query`, and whether

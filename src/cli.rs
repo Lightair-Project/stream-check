@@ -268,11 +268,22 @@ pub fn summary_text(r: &Value) -> String {
             );
         }
         if t["has_audio"] == true {
+            let l = &t["levels"];
             out += &format!(
-                "  track {} audio {} {} Hz\n",
+                "  track {} audio {} {} Hz, {} ch, {:.0} kbps; loudness {} LUFS integrated, peak {} dB{}{}\n",
                 t["track"],
                 t["audio"]["codec"].as_str().unwrap_or("?").to_uppercase(),
-                t["audio"]["sample_rate"]
+                t["audio"]["sample_rate"],
+                t["audio"]["channels"],
+                t["audio"]["kbps"].as_f64().unwrap_or(0.0),
+                l["integrated_lufs"].as_f64().map_or("?".into(), |x| format!("{x:.1}")),
+                l["max_peak_db"].as_f64().map_or("?".into(), |x| format!("{x:.1}")),
+                match (l["silent"] == true, l["silence_events"].as_u64().unwrap_or(0)) {
+                    (true, _) => ", silent now".to_string(),
+                    (false, 0) => String::new(),
+                    (false, n) => format!(", silent {n} time(s)"),
+                },
+                t["audio_recording"].as_str().map_or(String::new(), |f| format!("; recorded in {f}")),
             );
         }
     }

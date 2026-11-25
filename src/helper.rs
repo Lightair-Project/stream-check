@@ -212,6 +212,52 @@ pub fn spawn(session: Arc<Session>, seg: u32, dir: PathBuf) -> mpsc::Sender<Vec<
     tx
 }
 
+/// Starts a decoder for one sound (Matroska in, as a recording is written): its levels go to
+/// `on_levels` every 300 ms of sound. It ends when the sender is dropped.
+pub fn spawn_levels(mut on_levels: impl FnMut(Levels) + Send + 'static) -> mpsc::Sender<Vec<u8>> {
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(512);
+    tokio::spawn(async move {
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-fflags", "+nobuffer", "-probesize", "32768"])
+            .args(["-analyzeduration", "0", "-f", "matroska", "-i", "pipe:0"])
+            .args(["-map", "0:a:0?", "-ac", "2", "-ar", "48000", "-f", "f32le", "pipe:1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let Ok(mut child) = cmd.spawn() else { return };
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        tokio::spawn(async move {
+            while let Some(b) = rx.recv().await {
+                if stdin.write_all(&b).await.is_err() {
+                    break;
+                }
+            }
+            let _ = stdin.shutdown().await;
+        });
+        let mut meter = Meter::new(2, 48000);
+        let mut buf = vec![0u8; 4800 * 2 * 4];
+        let mut fill = 0;
+        loop {
+            match stdout.read(&mut buf[fill..]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => fill += n,
+            }
+            if fill < buf.len() {
+                continue;
+            }
+            fill = 0;
+            let samples: Vec<f32> = buf.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+            for l in meter.push(&samples) {
+                on_levels(l);
+            }
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
+    });
+    tx
+}
+
 /// What ffprobe makes of a recording: the proof that it plays. `Ok(None)`: nothing to check (no
 /// file, or an empty one); `Err`: ffprobe couldn't read it, with ffprobe's own first error line.
 pub fn probe(path: &Path) -> Result<Option<Value>, String> {

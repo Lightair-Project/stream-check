@@ -1187,11 +1187,21 @@ impl Session {
         }
     }
 
-    pub fn feed(&self, conn: u64, m: Media) {
+    pub fn feed(self: &Arc<Self>, conn: u64, m: Media) {
         self.feed_at(conn, m, Instant::now());
     }
 
-    pub fn feed_at(&self, conn: u64, m: Media, now: Instant) {
+    /// Levels of a multitrack track's sound, from its own decoder.
+    fn set_track_levels(&self, id: u8, l: Levels) {
+        let mut g = self.inner.lock();
+        if g.state == State::Ended {
+            return;
+        }
+        let notes = g.tracks.set_levels(id, l, Instant::now());
+        self.push_notes(&mut g, notes);
+    }
+
+    pub fn feed_at(self: &Arc<Self>, conn: u64, m: Media, now: Instant) {
         let mut g = self.inner.lock();
         if g.conn.map(|c| c.0) != Some(conn) {
             return;
@@ -1228,6 +1238,16 @@ impl Session {
                 }
                 self.push_notes(&mut g, notes);
                 if let Some(file) = started {
+                    // a track's sound gets its own decoder for its levels
+                    if file.ends_with("-audio.mkv") && crate::helper::ffmpeg_available() {
+                        let s = Arc::downgrade(self);
+                        let meter = crate::helper::spawn_levels(move |l| {
+                            if let Some(s) = s.upgrade() {
+                                s.set_track_levels(id, l);
+                            }
+                        });
+                        g.tracks.attach_meter(id, meter);
+                    }
                     let started_s = now.duration_since(self.t0).as_secs_f64();
                     g.segments.push(SegmentInfo::new(file, "mkv", conn, started_s));
                 }

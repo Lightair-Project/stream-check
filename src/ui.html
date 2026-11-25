@@ -347,7 +347,9 @@ function makeCard(s0) {
     const kq = s.client && s.client.key_query, er = s.client && s.client.enhanced_rtmp;
     tracksHead.textContent = `${s.tracks.count} tracks (track 0 is the picture above) · ${fmt(s.tracks.total_video_kbps, 0)} kbps of picture in all`
       + (kq ? ` · key query: ${kq.client_config_id ? "clientConfigId is there" : "no clientConfigId"}` : "")
-      + (er ? ` · Enhanced RTMP caps ${er.caps_ex}${er.multitrack ? " (multitrack)" : ""}` : "");
+      + (er ? ` · Enhanced RTMP caps ${er.caps_ex}${er.multitrack ? " (multitrack)" : ""}` : "")
+      + tr.filter(t => t.has_audio && t.audio).map(t => { const ta = t.audio, tl = t.levels || {};
+          return ` · track ${t.track} sound: ${String(ta.codec || "?").toUpperCase()} ${ta.sample_rate} Hz · ${fmt(ta.kbps, 0)} kbps · ${tl.available ? fmt(tl.integrated_lufs) + " LUFS, peak " + fmt(tl.max_peak_db) + " dB" : "no levels"}${tl.silent ? " · SILENT" : tl.silence_events ? " · silent " + tl.silence_events + "×" : ""}`; }).join("");
     for (const t of tr) {
       if (!t.has_video) continue;
       if (!trackViews.has(t.track)) { const v = trackView(t.track); trackViews.set(t.track, v); tracksEl.append(v.fig); }
