@@ -313,6 +313,7 @@ impl FlvDemux {
         let nal_size = match codec {
             VCodec::H264 => record.get(4).map_or(4, |b| (b & 3) as usize + 1),
             VCodec::Hevc => record.get(21).map_or(4, |b| (b & 3) as usize + 1),
+            VCodec::Av1 | VCodec::Vp9 | VCodec::Vp8 => 4,
         };
         self.video_tracks.insert(track, VideoTrackState { codec, nal_size });
         Self::push(track, Media::VideoConfig { codec, record: Arc::new(record.to_vec()) }, out);

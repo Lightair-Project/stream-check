@@ -92,6 +92,8 @@ impl AnnexB {
             let record = match self.codec {
                 VCodec::H264 => nal::build_avcc(&self.sps, &self.pps),
                 VCodec::Hevc => nal::build_hvcc(&self.vps, &self.sps, &self.pps),
+                // not NAL codecs: no parameter sets to collect
+                VCodec::Av1 | VCodec::Vp9 | VCodec::Vp8 => None,
             };
             let now = (self.vps.clone(), self.sps.clone(), self.pps.clone());
             if let Some(record) = record {
