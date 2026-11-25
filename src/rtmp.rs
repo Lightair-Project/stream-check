@@ -886,9 +886,9 @@ mod tests {
         d.video(40, &tag, &mut out, &mut warn);
         assert!(matches!(out[3], Media::Video { key: true, .. }));
         // an unknown codec is said so once
-        d.video(0, &[0x90, b'a', b'v', b'0', b'1', 0], &mut out, &mut warn);
-        d.video(0, &[0x90, b'a', b'v', b'0', b'1', 0], &mut out, &mut warn);
-        assert_eq!(warn.len(), 1);
+        d.video(0, &[0x90, b'x', b'x', b'x', b'x', 0], &mut out, &mut warn);
+        d.video(0, &[0x90, b'x', b'x', b'x', b'x', 0], &mut out, &mut warn);
+        assert_eq!(warn.len(), 1, "{warn:?}");
     }
 
     #[test]

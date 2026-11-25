@@ -109,3 +109,55 @@ async fn an_srt_stream_is_ingested_and_recorded() {
 async fn an_srt_stream_with_a_passphrase_is_ingested() {
     run(Some("a-test-passphrase"), "srt-secret").await;
 }
+
+/// A two-second stream sent to a lab where the `loss` fault is already set for its key; the
+/// session once it has ended.
+async fn lossy(key: &str) -> Option<(stream_check::app::Running, std::sync::Arc<stream_check::hub::Session>, tempfile::TempDir)> {
+    if !stream_check::helper::ffmpeg_available() {
+        eprintln!("no ffmpeg: skipped");
+        return None;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("t.ts");
+    assert!(make_ts(&file));
+    // the first two seconds of it, sent over two seconds
+    let ts = std::fs::read(&file).unwrap();
+    let ts = ts[..ts.len() * 2 / 5 / 188 * 188].to_vec();
+    let mut cfg = Config::for_test(dir.path().join("data"));
+    cfg.grace_override = Some(1);
+    let lab = start(cfg).await.unwrap();
+    lab.hub.fault(key, &stream_check::faults::FaultRequest { loss_pct: Some(10.0), ..Default::default() }).unwrap();
+    let addr = format!("127.0.0.1:{}", lab.srt.port());
+    let mut socket =
+        SrtSocket::builder().latency(Duration::from_millis(120)).call(addr.as_str(), Some(&format!("open/{key}"))).await.unwrap();
+    let per_chunk = Duration::from_secs_f64(2.0 * 1316.0 / ts.len() as f64);
+    for chunk in ts.chunks(1316) {
+        socket.send((Instant::now(), Bytes::copy_from_slice(chunk))).await.unwrap();
+        tokio::time::sleep(per_chunk).await;
+    }
+    socket.close().await.unwrap();
+    let s = lab.hub.find(key).expect("a session");
+    let end = Instant::now() + Duration::from_secs(20);
+    while s.inner.lock().state != State::Ended {
+        assert!(Instant::now() < end, "the session didn't end");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Some((lab, s, dir))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_loss_fault_throws_datagrams_away_and_the_gaps_are_said() {
+    let Some((_lab, s, _dir)) = lossy("srt-loss").await else { return };
+    let stats = stream_check::srt_stats::stats_json(&s, 0);
+    assert!(stats["total"]["fault_dropped"].as_u64() > Some(0), "{}", stats["total"]);
+    let g = s.inner.lock();
+    assert!(g.events.iter().any(|e| e.kind == "ts-loss"), "the transport stream's continuity jumps are said");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_report_and_the_sessions_json_carry_the_srt_link_statistics() {
+    let Some((_lab, s, _dir)) = lossy("srt-loss-report").await else { return };
+    let report = s.inner.lock().report.clone().unwrap();
+    assert!(report["srt"]["total"]["fault_dropped"].as_u64() > Some(0), "{}", report["srt"]);
+    assert!(s.summary(false)["srt"].is_object(), "the web UI's `srt`");
+}
