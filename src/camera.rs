@@ -116,19 +116,83 @@ fn parse_info(line: &str) -> Option<Info> {
     })
 }
 
-/// "1920x1080@[1.000000 30.000000]fps" lines of ffmpeg's answer to a mode the camera hasn't.
-fn modes(text: &str) -> Vec<((u32, u32), f64, f64)> {
+/// The modes a camera offers, from ffmpeg's answer to one it hasn't: "Supported modes:" then
+/// lines like "[avfoundation @ 0x…]   1920x1080@[60.000000 60.000000]fps": (size, lowest and
+/// highest frame rate).
+pub fn modes(text: &str) -> Vec<((u32, u32), f64, f64)> {
     let mut out = vec![];
     for line in text.lines() {
-        let Some((size, rest)) = line.trim().rsplit(' ').next().and_then(|t| t.split_once("@[")) else { continue };
+        let Some((before, after)) = line.split_once("@[") else { continue };
+        let Some(size) = before.split_whitespace().last() else { continue };
         let Some((w, h)) = size.split_once('x') else { continue };
-        let Some((rates, _)) = rest.split_once(']') else { continue };
+        let Some((rates, _)) = after.split_once(']') else { continue };
         let r: Vec<f64> = rates.split_whitespace().filter_map(|x| x.parse().ok()).collect();
         if let (Ok(w), Ok(h), Some(&lo), Some(&hi)) = (w.parse(), h.parse(), r.first(), r.last()) {
-            out.push(((w, h), lo, hi));
+            out.push(((w, h), lo.min(hi), hi.max(lo)));
         }
     }
     out
+}
+
+/// The offered mode to retry with, and the frame rate to ask for: the size asked for at the
+/// rate nearest the one asked for (within the mode's range when it can be), else the nearest
+/// size; without a size, the largest mode that does the rate, else the one nearest it.
+pub fn pick_mode(offered: &[((u32, u32), f64, f64)], size: Option<(u32, u32)>, fps: f64) -> Option<((u32, u32), f64)> {
+    let off = |m: &((u32, u32), f64, f64)| {
+        if fps < m.1 {
+            m.1 - fps
+        } else if fps > m.2 {
+            fps - m.2
+        } else {
+            0.0
+        }
+    };
+    let area = |s: (u32, u32)| s.0 as i64 * s.1 as i64;
+    let pick = match size {
+        Some(want) if offered.iter().any(|m| m.0 == want) => {
+            offered.iter().filter(|m| m.0 == want).min_by(|a, b| off(a).total_cmp(&off(b)))
+        }
+        Some(want) => offered.iter().min_by(|a, b| {
+            let (da, db) = ((area(a.0) - area(want)).abs(), (area(b.0) - area(want)).abs());
+            da.cmp(&db).then(off(a).total_cmp(&off(b)))
+        }),
+        None => offered.iter().min_by(|a, b| off(a).total_cmp(&off(b)).then(area(b.0).cmp(&area(a.0)))),
+    }?;
+    Some((pick.0, fps.clamp(pick.1, pick.2)))
+}
+
+/// Whether ffmpeg's failure reads as macOS refusing this process the camera: AVFoundation then
+/// fails every device with "Input/output error" before any mode is looked at (a mode it hasn't
+/// lists the modes instead).
+pub fn camera_denied(said: &[String]) -> bool {
+    let text = said.join("\n").to_ascii_lowercase();
+    if !modes(&text).is_empty() || text.contains("not supported") {
+        return false;
+    }
+    text.contains("not authorized")
+        || text.contains("not permitted")
+        || text.contains("failed to create av capture input device")
+        || text.contains("input/output error")
+}
+
+/// What to say when the camera didn't start, from what ffmpeg said.
+pub fn start_failure(said: &[String], tried_modes: bool) -> String {
+    let why = said
+        .iter()
+        .rev()
+        .find(|l| {
+            let l = l.to_ascii_lowercase();
+            l.contains("error") || l.contains("not supported") || l.contains("cannot") || l.contains("failed") || l.contains("no frame")
+        })
+        .cloned()
+        .unwrap_or_else(|| said.last().cloned().unwrap_or_default());
+    if !tried_modes && camera_denied(said) {
+        return format!(
+            "this app isn't allowed to use cameras: System Settings › Privacy & Security › Camera (ffmpeg said: {})",
+            why.trim()
+        );
+    }
+    format!("the camera didn't start: {}", why.trim())
 }
 
 fn spawn(name: &str, fps: Option<f64>, size: Option<(u32, u32)>, thumbs: &std::path::Path) -> std::io::Result<Child> {
@@ -229,38 +293,18 @@ pub async fn start(
         match try_start(name, fps.or(Some(30.0)), size, &scratch).await {
             Ok(s) => break s,
             Err(said) => {
-                let text = said.join("\n");
-                let m = modes(&text);
-                if !m.is_empty() && !tried_modes {
-                    // the camera doesn't do that mode: take the one asked for, or its largest
-                    tried_modes = true;
-                    let pick = m
-                        .iter()
-                        .filter(|(s, _, _)| size.is_none_or(|want| *s == want))
-                        .max_by_key(|(s, _, hi)| (s.0 * s.1, (*hi * 1000.0) as u64))
-                        .or(m.first())
-                        .copied()
-                        .unwrap();
-                    size = Some(pick.0);
-                    let want = fps.unwrap_or(30.0);
-                    fps = Some(if want >= pick.1 && want <= pick.2 { want } else { pick.2.min(60.0).max(pick.1) });
-                    continue;
+                let offered = modes(&said.join("\n"));
+                if !tried_modes {
+                    if let Some((pick, rate)) = pick_mode(&offered, size, fps.unwrap_or(30.0)) {
+                        // the camera doesn't do that mode: take the nearest one it offers
+                        tried_modes = true;
+                        size = Some(pick);
+                        fps = Some(rate);
+                        continue;
+                    }
                 }
-                let why = said
-                    .iter()
-                    .rev()
-                    .find(|l| {
-                        let l = l.to_ascii_lowercase();
-                        l.contains("error")
-                            || l.contains("not supported")
-                            || l.contains("cannot")
-                            || l.contains("failed")
-                            || l.contains("no frame")
-                    })
-                    .cloned()
-                    .unwrap_or_else(|| said.last().cloned().unwrap_or_default());
                 let _ = std::fs::remove_dir_all(&scratch);
-                return Err(format!("the camera didn't start: {why}"));
+                return Err(start_failure(&said, tried_modes));
             }
         }
     };

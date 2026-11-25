@@ -312,8 +312,11 @@ report to `--data`. Running there, `pull` lasts until the source stops, `--for` 
   back, stalls), the sound's format, levels and loudness, and the A/V offset between them.
 - **Cameras** (macOS): ffmpeg captures the named camera (AVFoundation) and describes every frame; the lab
   measures its size, pixel format and frame rate from the camera's timestamps and from arrival. If the
-  camera doesn't do 30 fps (or the `fps` and `size` asked for), the lab takes the mode it offers. Screens
-  aren't listed or captured. macOS asks once for permission to use the camera.
+  camera doesn't do 30 fps (or the `fps` and `size` asked for), the lab retries with a mode it offers: the size
+  asked for at its nearest frame rate (a 1920x1080 camera that only does 60 fps is taken at 60), else the nearest
+  size. Screens aren't listed or captured. macOS asks once for permission to use the camera; when it has been
+  refused (AVFoundation then fails every camera with "Input/output error"), the lab says the process isn't
+  allowed to use cameras and where to allow it (System Settings › Privacy & Security › Camera).
 - **The picture** (NDI and cameras): its mean colour and brightness, and whether it went black or stopped
   changing (events when it does and when it comes back), in `source.picture`. A picture black the whole
   time is a problem; one that never changed is said, but isn't one (a still scene is a still picture).
