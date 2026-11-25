@@ -443,15 +443,16 @@ function makeCard(s0) {
     const v = s.stats.video, sps = v.sps, bs = v.bitstream, col = sps && sps.colour;
     if (col) {
       const names = [col.primaries_name, col.transfer_name, col.matrix_name].filter(Boolean);
-      const range = col.full_range == null ? "range not tagged" : col.full_range ? "full range" : "limited range";
-      const depth = sps.bit_depth_luma ? ` · ${sps.bit_depth_luma}-bit` : "";
-      set("colour", `${names.length ? [...new Set(names)].join(" / ") : "not tagged"} · ${range}${depth}`, bs && bs.colour_warnings && bs.colour_warnings.length ? "warn" : "",
+      const range = col.full_range == null ? (names.length ? "range not tagged" : "") : col.full_range ? "full range" : "limited range";
+      const depth = sps.bit_depth_luma ? `${sps.bit_depth_luma}-bit` : "";
+      set("colour", [names.length ? [...new Set(names)].join(" / ") : "not tagged", range, depth].filter(Boolean).join(" · "), bs && bs.colour_warnings && bs.colour_warnings.length ? "warn" : "",
         `primaries ${col.primaries ?? "–"}, transfer ${col.transfer ?? "–"}, matrix ${col.matrix ?? "–"}${col.chroma_loc_top != null ? ", chroma location " + col.chroma_loc_top : ""}${sps.vui === false ? " (no VUI)" : ""}`);
     } else hide("colour");
     if (bs) {
       const sei = Object.entries(bs.sei || {});
       const bad = bs.bad_nal_lengths || bs.idr_not_marked;
-      set("bits", `IDR ${bs.idr} · I ${bs.pictures_i} / P ${bs.pictures_p} / B ${bs.pictures_b}${bs.sps_changes ? " · SPS changed " + bs.sps_changes + "×" : ""}`, bad ? "bad" : bs.sps_changes || bs.keyframes_not_idr ? "warn" : "",
+      const nal = /^(h264|hevc)$/.test(v.codec || "");
+      set("bits", `${nal ? "IDR " + bs.idr + " · " : ""}I ${bs.pictures_i} / P ${bs.pictures_p} / B ${bs.pictures_b}${bs.sps_changes ? ` · ${nal ? "SPS" : "sequence header"} changed ${bs.sps_changes}×` : ""}`, bad ? "bad" : bs.sps_changes || bs.keyframes_not_idr ? "warn" : "",
         [`${bs.keyframes_not_idr} keyframe(s) without an IDR, ${bs.idr_not_marked} IDR(s) not marked key, ${bs.bad_nal_lengths} picture(s) with bad NAL lengths`,
          `in-band SPS on ${bs.inband_sps} picture(s), ${bs.inband_sps_differs} differing`,
          sei.length ? "SEI: " + sei.map(([k, n]) => `${k} ×${n}`).join(", ") : "no SEI",
