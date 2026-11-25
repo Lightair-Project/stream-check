@@ -17,6 +17,9 @@ run a streaming test and read the verdict without looking at a screen.
   ones for N seconds, freeze reading, throttle, add latency, lose packets.
 - **See and hear it** in a browser (no plug-ins): live preview with sound and level meters, stats with
   graphs, a thumbnail timeline, an event log.
+- **Files and pulls:** recordings and replay clips (MP4, MOV, fragmented and hybrid MP4, MKV, FLV, TS) are
+  checked like a stream (`check-file`), and the lab can play from an RTSP server, receive an NDI source or
+  capture a camera (a virtual camera) as a session of its own (`pull`).
 - **Evidence:** every session is recorded in the protocol's own container (FLV, MPEG-TS or Matroska)
   and ends with a JSON report, with ffprobe's verdict that the recording plays.
 
@@ -237,6 +240,59 @@ stream-check fault '*' refuse 10
 curl -X POST localhost:8890/api/faults/mytest -d '{"throttle_kbps":800,"for_s":20}' -H 'Content-Type: application/json'
 ```
 
+## Files, RTSP, NDI and cameras
+
+Besides taking streams, the lab can check what a sender makes in other ways. Each makes a session like a
+sender's: it is listed, measured with the same analysis, shown in the UI, and ends with a report, so `list`,
+`wait-for`, `report`, `events` and `end` work on it (its key is the file's name, or `--key`). A session's
+`kind` is `ingest`, `file` or `pull`; its `source` says what was read and what was found beyond the stats.
+
+```sh
+stream-check check-file ~/Movies/rec.mp4                  # a summary; exit 3 if problems were found
+stream-check check-file clip.mkv --profile twitch --json  # the whole report, held to a platform's rules
+stream-check pull rtsp://localhost:8554/live --for 30     # 30 s of an RTSP server, then the summary
+stream-check pull rtsp://localhost:8554/live              # with a lab running: starts, prints {id, key}
+stream-check pull "ndi://STUDIO (Lightair)" --wait        # until the source stops (or `end`)
+stream-check pull "camera://Lightair Virtual Camera?fps=30&size=1920x1080" --for 20
+stream-check sources ndi                                  # NDI sources on the network
+stream-check sources camera                               # this Mac's cameras
+```
+
+These go through a running Stream Check (`--url`, `$STREAM_CHECK_URL`, or the default address when it answers)
+so the session shows in its UI; otherwise, or with `--local`, they run in the command itself and write the
+report to `--data`. Running there, `pull` lasts until the source stops, `--for` runs out or Ctrl-C.
+
+- **Files:** ffmpeg is the demuxer: it copies the packets out as FLV, which the lab reads with its RTMP code,
+  and they go through the live analysis on the file's own clock (read as fast as the disk allows, measured
+  as if it played: codec, profile and level, size, frame rate, keyframes, GOP, B-frames, timestamps, gaps,
+  A/V offset, the profile's rules). `kbps` is the average over the file, `peak_kbps` the busiest 2 s.
+  Loudness (EBU R128) is decoded with ffmpeg for **every** sound track, and each track beyond the first is
+  measured on its own (`source.audio_tracks`, with ffprobe's title, language, codec and duration). The
+  report's `source` also has ffprobe's description and complaints, the duration of the whole and of picture
+  and sound, where the sound starts against the picture, the chapters, and for MP4 and MOV the top-level
+  boxes: `layout` (`progressive`, `fragmented`, `hybrid` or `unfinished`), whether the index comes first,
+  and a file cut off in the middle of a box or without its `moov` (a recording that wasn't finished), which
+  are problems. Packets are read for H.264, HEVC, AV1, VP9, AAC and Opus; other codecs get ffprobe's
+  description (and loudness) only. Thumbnails come from the keyframes.
+- **RTSP:** the lab is the player: OPTIONS, DESCRIBE, SETUP, PLAY, with RTP over the RTSP connection
+  (interleaved TCP), H.264 (RFC 6184) and HEVC (RFC 7798) pictures, AAC (RFC 3640) and Opus sound, the
+  parameter sets from the SDP or the stream, Basic authentication from `rtsp://user:pass@host/…`, and an
+  OPTIONS every half session timeout to keep it alive. It is recorded (`seg01.mkv`), previewed and measured
+  like an ingest, with `stats.rtp` (received, lost, duplicates per track); `source` has the server's SDP and
+  tracks. It ends when the server closes, sends nothing for 10 s, or at `end` (with a TEARDOWN). Faults
+  `freeze`, `throttle` and `drop` apply to its reading.
+- **NDI:** NDI's runtime is loaded when the session starts if it's installed (NDI Tools, the NDI SDK, or
+  `NDI_RUNTIME_DIR_V6`/`V5`); otherwise the lab says NDI isn't installed. It measures the picture's size,
+  pixel format, declared and measured frame rate, timing from the source's own timestamps (gaps, going
+  back, stalls), the sound's format, levels and loudness, and the A/V offset between them.
+- **Cameras** (macOS): ffmpeg captures the named camera (AVFoundation) and describes every frame; the lab
+  measures its size, pixel format and frame rate from the camera's timestamps and from arrival. If the
+  camera doesn't do 30 fps (or the `fps` and `size` asked for), the lab takes the mode it offers. Screens
+  aren't listed or captured. macOS asks once for permission to use the camera.
+- **The picture** (NDI and cameras): its mean colour and brightness, and whether it went black or stopped
+  changing (events when it does and when it comes back), in `source.picture`. A picture black the whole
+  time is a problem; one that never changed is said, but isn't one (a still scene is a still picture).
+
 ## For scripts and agents
 
 ```sh
@@ -261,6 +317,9 @@ stream-check list
 | `GET /api/sessions/{id}/report` | the report (a live session gets a report of the moment); earlier runs are read from disk |
 | `POST /api/faults/{key or *}` · `POST /api/sessions/{id}/fault` | `{"drop":true}`, `{"refuse_s":10}`, `{"freeze_s":10}`, `{"throttle_kbps":500,"for_s":30}`, `{"latency_ms":300}`, `{"loss_pct":5}`, `{"clear":true}` |
 | `POST /api/sessions/{id}/end` | end a session now and write its report |
+| `POST /api/check-file` | `{"path":"/abs/rec.mp4","profile":"twitch","key":"rec"}`: check a file on the lab's computer; answers `{id, key}` at once |
+| `POST /api/pull` | `{"url":"rtsp://…","key":"…","profile":"open","for_s":30}`: pull an RTSP server, an NDI source or a camera; `{id, key}` |
+| `GET /api/sources/{ndi or camera}` | `{available, sources, error}`: NDI sources, or cameras |
 | `GET /api/faults`, `/api/rejections`, `/api/profiles`, `/api/past` | faults in force, refused connections, profiles, earlier reports |
 | `GET /media/{id}/{file}` | recordings and thumbnails |
 | `ws:///ws/state`, `ws:///ws/preview/{id}` | the UI's live feeds |
@@ -291,6 +350,9 @@ thumbnails with their times, and the event log. Stalls, gaps and reconnects are 
   spatial layers joined into a superframe) and VP8 (RFC 7741), each with RTX;
   the codec is the one negotiated for the track's SSRC. AV1, VP9 and VP8 pictures are measured the same way as
   over RTMP.
+- A pulled RTSP stream's picture and sound are put on one clock by the server's RTP-Info when it sends one;
+  without it (Lightair's server sends none) each track starts from its first packet's arrival, so the A/V
+  offset includes any difference in the sender's encoder delays. RTCP sender reports aren't read.
 - RTMP recordings are the FLV tags as sent; SRT recordings the transport stream as sent; WHIP recordings and
   multitrack tracks beyond the first are written as Matroska (`V_AV1` with its av1C, `V_VP9`, `V_VP8`, H.264,
   HEVC, AAC, Opus).
@@ -304,7 +366,8 @@ cargo clippy --all-targets -- -D warnings
 
 Permissive dependencies only. The code is organised as: `rtmp`, `srt`/`ts`, `whip` (ingests), `hub` (sessions,
 grace, faults, recordings, reports), `analyze`, `nal` (parameter sets), `sei` (BPM, captions, user data),
-`levels` (level limits, colour tags), `profiles`, `faults`, `http` and `ui.html`, `cli`.
+`levels` (level limits, colour tags), `profiles`, `faults`, `http` and `ui.html`, `cli`; `file_check` (files),
+`pull` with `rtsp`, `ndi` and `camera` (sources the lab reads from), `picture` (an uncompressed picture's checks).
 
 Stream Check was built to test Lightair's streaming, and is used for that, but has no ties to it.
 

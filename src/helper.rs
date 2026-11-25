@@ -33,6 +33,89 @@ fn finite(x: f64) -> Option<f64> {
     x.is_finite().then_some(x)
 }
 
+/// Measures sound as it comes: EBU R128 loudness, peaks per channel, and silence. It takes
+/// interleaved samples and gives [`Levels`] every 300 ms of sound.
+pub struct Meter {
+    meter: Option<EbuR128>,
+    channels: usize,
+    /// Samples (all channels) in 100 ms.
+    chunk: usize,
+    pending: Vec<f32>,
+    quiet_chunks: u32,
+    peak: [f64; 2],
+    since_emit: u32,
+}
+
+impl Meter {
+    pub fn new(channels: u32, rate: u32) -> Meter {
+        let channels = channels.max(1);
+        Meter {
+            meter: EbuR128::new(channels, rate.max(8000), Mode::M | Mode::S | Mode::I).ok(),
+            channels: channels as usize,
+            chunk: (rate.max(8000) / 10) as usize * channels as usize,
+            pending: vec![],
+            quiet_chunks: 0,
+            peak: [0.0; 2],
+            since_emit: 0,
+        }
+    }
+
+    /// Interleaved samples in; the levels of each 300 ms finished out.
+    pub fn push(&mut self, samples: &[f32]) -> Vec<Levels> {
+        let mut out = vec![];
+        self.pending.extend_from_slice(samples);
+        let mut at = 0;
+        while self.pending.len() - at >= self.chunk {
+            let chunk: Vec<f32> = self.pending[at..at + self.chunk].to_vec();
+            at += self.chunk;
+            if let Some(l) = self.chunk_done(&chunk) {
+                out.push(l);
+            }
+        }
+        self.pending.drain(..at);
+        out
+    }
+
+    fn chunk_done(&mut self, samples: &[f32]) -> Option<Levels> {
+        let mut sumsq = 0f64;
+        for (i, s) in samples.iter().enumerate() {
+            // the first two channels are left and right; a mono sound counts as both
+            let ch = if self.channels == 1 { 0 } else { i % self.channels };
+            if ch < 2 {
+                self.peak[ch] = self.peak[ch].max(s.abs() as f64);
+            }
+            sumsq += (*s as f64) * (*s as f64);
+        }
+        if self.channels == 1 {
+            self.peak[1] = self.peak[0];
+        }
+        let rms = db((sumsq / samples.len().max(1) as f64).sqrt());
+        self.quiet_chunks = if rms < -60.0 { self.quiet_chunks + 1 } else { 0 };
+        if let Some(m) = &mut self.meter {
+            let _ = m.add_frames_f32(samples);
+        }
+        self.since_emit += 1;
+        if self.since_emit < 3 {
+            return None;
+        }
+        self.since_emit = 0;
+        let m = self.meter.as_ref();
+        let l = Levels {
+            available: true,
+            momentary_lufs: m.and_then(|m| m.loudness_momentary().ok()).and_then(finite),
+            short_term_lufs: m.and_then(|m| m.loudness_shortterm().ok()).and_then(finite),
+            integrated_lufs: m.and_then(|m| m.loudness_global().ok()).and_then(finite),
+            peak_l_db: Some(db(self.peak[0])),
+            peak_r_db: Some(db(self.peak[1])),
+            rms_db: Some(rms),
+            silent: self.quiet_chunks >= 20,
+            ..Default::default()
+        };
+        self.peak = [0.0; 2];
+        Some(l)
+    }
+}
+
 /// Starts the helper for one connection's segment; the sender takes the Matroska bytes.
 pub fn spawn(session: Arc<Session>, seg: u32, dir: PathBuf) -> mpsc::Sender<Vec<u8>> {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(512);
@@ -100,10 +183,7 @@ pub fn spawn(session: Arc<Session>, seg: u32, dir: PathBuf) -> mpsc::Sender<Vec<
             let _ = stderr.read_to_string(&mut s).await;
             s
         });
-        let mut meter = EbuR128::new(2, 48000, Mode::M | Mode::S | Mode::I).ok();
-        let mut quiet_chunks = 0u32;
-        let mut peak = [0f64; 2];
-        let mut since_emit = 0;
+        let mut meter = Meter::new(2, 48000);
         let mut buf = vec![0u8; 4800 * 2 * 4];
         let mut fill = 0;
         loop {
@@ -116,31 +196,7 @@ pub fn spawn(session: Arc<Session>, seg: u32, dir: PathBuf) -> mpsc::Sender<Vec<
             }
             fill = 0;
             let samples: Vec<f32> = buf.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
-            let mut sumsq = 0f64;
-            for (i, s) in samples.iter().enumerate() {
-                peak[i % 2] = peak[i % 2].max(s.abs() as f64);
-                sumsq += (*s as f64) * (*s as f64);
-            }
-            let rms = db((sumsq / samples.len() as f64).sqrt());
-            quiet_chunks = if rms < -60.0 { quiet_chunks + 1 } else { 0 };
-            if let Some(m) = &mut meter {
-                let _ = m.add_frames_f32(&samples);
-            }
-            since_emit += 1;
-            if since_emit >= 3 {
-                since_emit = 0;
-                let l = Levels {
-                    available: true,
-                    momentary_lufs: meter.as_ref().and_then(|m| m.loudness_momentary().ok()).and_then(finite),
-                    short_term_lufs: meter.as_ref().and_then(|m| m.loudness_shortterm().ok()).and_then(finite),
-                    integrated_lufs: meter.as_ref().and_then(|m| m.loudness_global().ok()).and_then(finite),
-                    peak_l_db: Some(db(peak[0])),
-                    peak_r_db: Some(db(peak[1])),
-                    rms_db: Some(rms),
-                    silent: quiet_chunks >= 20,
-                    ..Default::default()
-                };
-                peak = [0.0; 2];
+            for l in meter.push(&samples) {
                 session.set_levels(l);
             }
         }

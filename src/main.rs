@@ -8,6 +8,10 @@ async fn main() {
         print!("{}", cli::USAGE);
         return;
     }
+    if matches!(first, "check-file" | "pull" | "sources") {
+        let code = cli::run_lab(&args).await;
+        std::process::exit(code);
+    }
     if matches!(first, "addresses" | "list" | "report" | "wait-for" | "events" | "fault" | "end") {
         let code = tokio::task::spawn_blocking(move || cli::run(&args)).await.unwrap_or(2);
         std::process::exit(code);

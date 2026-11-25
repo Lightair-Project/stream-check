@@ -44,6 +44,9 @@ pub fn router(app: App) -> Router {
         .route("/api/sessions/{id}/report", get(report))
         .route("/api/sessions/{id}/fault", post(fault_session))
         .route("/api/sessions/{id}/end", post(end_session))
+        .route("/api/check-file", post(check_file))
+        .route("/api/pull", post(pull))
+        .route("/api/sources/{kind}", get(sources))
         .route("/api/faults", get(faults))
         .route("/api/faults/{target}", post(fault_target))
         .route("/api/rejections", get(rejections))
@@ -64,7 +67,8 @@ pub fn router(app: App) -> Router {
 async fn client_configuration(State(a): State<App>, headers: HeaderMap, body: String) -> Response {
     let req: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
     let config_id = format!("stream-check-{:x}", crate::hub::now_ms());
-    let fail = |msg: &str| Json(json!({ "meta": { "config_id": config_id }, "status": { "result": "error", "html_en_us": msg } })).into_response();
+    let fail =
+        |msg: &str| Json(json!({ "meta": { "config_id": config_id }, "status": { "result": "error", "html_en_us": msg } })).into_response();
     if req.is_null() {
         return fail("Stream Check: the request isn't JSON.");
     }
@@ -217,9 +221,44 @@ async fn end_session(State(a): State<App>, Path(id): Path<String>) -> Response {
         Ok(s) => s,
         Err(e) => return e,
     };
-    s.kill();
-    a.hub.finalize(s, "ended from the UI or API".into()).await;
+    if s.kind == "pull" || s.kind == "file" {
+        // the reader puts its last numbers in before the report is written
+        crate::pull::stop(&a.hub, &s, "ended from the UI or API".into()).await;
+    } else {
+        s.kill();
+        a.hub.finalize(s, "ended from the UI or API".into()).await;
+    }
     Json(json!({ "ok": true })).into_response()
+}
+
+#[derive(Deserialize)]
+struct CheckFile {
+    path: String,
+    profile: Option<String>,
+    key: Option<String>,
+}
+
+/// Starts checking a file on this computer; the session's id comes back at once, its report
+/// when the file has been read (`wait-for <key> --ended`, then `report`).
+async fn check_file(State(a): State<App>, Json(r): Json<CheckFile>) -> Response {
+    let req = crate::file_check::Request { path: r.path.into(), profile: r.profile.unwrap_or_else(|| "open".into()), key: r.key };
+    match crate::file_check::start(&a.hub, req) {
+        Ok(s) => Json(json!({ "ok": true, "id": s.id, "key": s.key })).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// Starts pulling from an RTSP server, an NDI source or a camera.
+async fn pull(State(a): State<App>, Json(r): Json<crate::pull::PullRequest>) -> Response {
+    match crate::pull::start(&a.hub, r).await {
+        Ok(s) => Json(json!({ "ok": true, "id": s.id, "key": s.key })).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// NDI sources on the network, or cameras on this computer.
+async fn sources(Path(kind): Path<String>) -> Json<Value> {
+    Json(crate::pull::sources(&kind).await)
 }
 
 #[derive(Deserialize)]

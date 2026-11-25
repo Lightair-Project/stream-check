@@ -23,6 +23,17 @@ USAGE
   stream-check events <session|key> [--kind <kind>]
   stream-check fault <key|session|*> <drop | refuse <s> | freeze <s> | throttle <kbps> | latency <ms> | loss <pct> | clear> [--for <s>]
   stream-check end <session|key>        finish a session now (writes its report)
+  stream-check check-file <path> [--profile <name>] [--key <name>] [--json]
+                                        read a recording or clip (MP4, MOV, MKV, FLV, TS) as a session; prints
+                                        its summary (or the JSON report); exit 3 if problems were found
+  stream-check pull <url> [--key <name>] [--profile <name>] [--for <s>] [--wait] [--json]
+                                        pull rtsp://host:8554/live, ndi://MACHINE (Source) or
+                                        camera://<name>[?fps=30&size=1920x1080] as a session
+  stream-check sources <ndi|camera>     the NDI sources on the network, or this Mac's cameras
+
+  check-file, pull and sources go through a running Stream Check (--url) when one answers, so
+  the session shows in its UI; otherwise (or with --local) they run here and write the report
+  to --data. Running here, pull waits until the source stops, --for runs out or Ctrl-C.
 
 SERVE OPTIONS
   --http-port <n>        web UI, API and WHIP (default 8890)
@@ -164,7 +175,7 @@ fn positional(args: &[String], skip: usize) -> Vec<&String> {
     let mut i = skip;
     while i < args.len() {
         if args[i].starts_with("--") {
-            i += if matches!(args[i].as_str(), "--live" | "--ended" | "--summary" | "--json") { 1 } else { 2 };
+            i += if matches!(args[i].as_str(), "--live" | "--ended" | "--summary" | "--json" | "--local" | "--wait") { 1 } else { 2 };
         } else {
             out.push(&args[i]);
             i += 1;
@@ -191,7 +202,18 @@ pub fn summary_text(r: &Value) -> String {
         r["duration_s"].as_f64().unwrap_or(0.0),
         r["end_reason"].as_str().map_or(String::new(), |e| format!(" ({e})")),
     );
-    if let Some(s) = v["sps"].as_object() {
+    out += &source_text(r);
+    if let (Some(s), true) = (v["sps"].as_object(), v["codec"].is_null()) {
+        out += &format!(
+            "  video  {} {}x{}, {:.1} fps (declared {}), arrival {:.1} fps\n",
+            s["profile"].as_str().unwrap_or("?"),
+            s["width"],
+            s["height"],
+            v["fps"].as_f64().unwrap_or(0.0),
+            s["declared_fps"].as_f64().map_or("?".into(), |f| format!("{f:.2}")),
+            v["fps_arrival"].as_f64().unwrap_or(0.0),
+        );
+    } else if let Some(s) = v["sps"].as_object() {
         out += &format!(
             "  video  {} {} level {}, {}x{}, {:.1} fps, {:.0} kbps, keyframe every {} s, GOP {}{}\n",
             v["codec"].as_str().map_or("?".into(), |c| c.to_uppercase()),
@@ -244,7 +266,12 @@ pub fn summary_text(r: &Value) -> String {
             );
         }
         if t["has_audio"] == true {
-            out += &format!("  track {} audio {} {} Hz\n", t["track"], t["audio"]["codec"].as_str().unwrap_or("?").to_uppercase(), t["audio"]["sample_rate"]);
+            out += &format!(
+                "  track {} audio {} {} Hz\n",
+                t["track"],
+                t["audio"]["codec"].as_str().unwrap_or("?").to_uppercase(),
+                t["audio"]["sample_rate"]
+            );
         }
     }
     if let Some(total) = r["tracks"]["total_video_kbps"].as_f64() {
@@ -264,6 +291,244 @@ pub fn summary_text(r: &Value) -> String {
         out += &format!("  verdict: {}\n", if ok { "ok" } else { "problems found" });
     }
     out
+}
+
+/// The lines a file or pull session adds: what was read, its tracks, its picture.
+fn source_text(r: &Value) -> String {
+    let src = &r["source"];
+    let mut out = String::new();
+    match src["kind"].as_str() {
+        Some("file") => {
+            out += &format!(
+                "  file   {} ({}), {} bytes, {} s, {:.0} kbps in all{}{}\n",
+                src["path"].as_str().unwrap_or("?"),
+                src["format_long"].as_str().or(src["format"].as_str()).unwrap_or("?"),
+                src["bytes"],
+                src["duration_s"].as_f64().map_or("?".into(), |d| format!("{d:.2}")),
+                src["average_kbps"].as_f64().unwrap_or(0.0),
+                src["container"]["layout"].as_str().map_or(String::new(), |l| format!(", {l} MP4")),
+                src["chapters"].as_array().filter(|c| !c.is_empty()).map_or(String::new(), |c| format!(", {} chapter(s)", c.len())),
+            );
+            if let Some(o) = src["av_start_offset_ms"].as_f64() {
+                let when = if o >= 0.0 { format!("{o:.0} ms after") } else { format!("{:.0} ms before", -o) };
+                out += &format!(
+                    "  start  sound starts {when} the picture; picture {} s, sound {} s\n",
+                    src["video_duration_s"].as_f64().map_or("?".into(), |d| format!("{d:.2}")),
+                    src["audio_duration_s"].as_f64().map_or("?".into(), |d| format!("{d:.2}"))
+                );
+            }
+            for (i, t) in src["audio_tracks"].as_array().into_iter().flatten().enumerate() {
+                out += &format!(
+                    "  sound track {i}: {} {} Hz {} ch{}, {:.0} kbps, {} LUFS integrated, peak {} dB{}\n",
+                    t["codec"].as_str().unwrap_or("?"),
+                    t["sample_rate"].as_str().unwrap_or("?"),
+                    t["channels"],
+                    t["title"].as_str().map_or(String::new(), |n| format!(" \"{n}\"")),
+                    t["measured"]["kbps"].as_f64().unwrap_or(0.0),
+                    t["levels"]["integrated_lufs"].as_f64().map_or("?".into(), |l| format!("{l:.1}")),
+                    t["levels"]["max_peak_db"].as_f64().map_or("?".into(), |l| format!("{l:.1}")),
+                    if t["levels"]["silent"] == true { ", silent at the end" } else { "" },
+                );
+            }
+        }
+        Some("rtsp") => {
+            out += &format!(
+                "  rtsp   {} (server {}), {}\n",
+                src["url"].as_str().unwrap_or("?"),
+                src["server"].as_str().unwrap_or("?"),
+                src["tracks"].as_array().map_or(String::new(), |t| t
+                    .iter()
+                    .map(|x| format!("{} {}", x["media"].as_str().unwrap_or(""), x["codec"].as_str().unwrap_or("")))
+                    .collect::<Vec<_>>()
+                    .join(", ")),
+            );
+            let rtp = &r["stats"]["rtp"];
+            out += &format!(
+                "  rtp    video {} received, {} lost; sound {} received, {} lost\n",
+                rtp["video"]["received"], rtp["video"]["lost"], rtp["audio"]["received"], rtp["audio"]["lost"]
+            );
+        }
+        Some(k @ ("ndi" | "camera")) => {
+            out += &format!("  {k:<6} {}\n", src["name"].as_str().unwrap_or("?"));
+        }
+        _ => {}
+    }
+    if let Some(p) = src["picture"].as_object() {
+        out += &format!(
+            "  picture mean colour {}, brightness {:.0}/255; black {:.1} s; frozen {} time(s), longest {:.1} s{}\n",
+            p["mean_colour"].as_str().unwrap_or("?"),
+            p["mean_luma"].as_f64().unwrap_or(0.0),
+            p["black_s"].as_f64().unwrap_or(0.0),
+            p["frozen_events"],
+            p["longest_frozen_s"].as_f64().unwrap_or(0.0),
+            if src["picture_never_changed"] == true { "; it never changed" } else { "" },
+        );
+    }
+    out
+}
+
+/// `check-file`, `pull` and `sources`: through a running Stream Check when one answers (or
+/// `--url` says where), otherwise here, in this process. Returns the exit code.
+pub async fn run_lab(args: &[String]) -> i32 {
+    let explicit = args.iter().any(|a| a == "--url") || std::env::var("STREAM_CHECK_URL").is_ok();
+    let local = args.iter().any(|a| a == "--local");
+    let a = args.to_vec();
+    let remote = !local
+        && (explicit
+            || tokio::task::spawn_blocking(move || {
+                let mut c = Client::new(&a);
+                c.agent =
+                    ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(2))).build().into();
+                c.get("/api/status").is_ok()
+            })
+            .await
+            .unwrap_or(false));
+    let result = if remote {
+        let a = args.to_vec();
+        tokio::task::spawn_blocking(move || run_remote(&a)).await.unwrap_or_else(|e| Err(e.to_string()))
+    } else {
+        run_local(args).await
+    };
+    match result {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("{e}");
+            2
+        }
+    }
+}
+
+fn print_report(report: &Value, json_out: bool) -> i32 {
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(report).unwrap_or_default());
+    } else {
+        print!("{}", summary_text(report));
+    }
+    if report["ok"].as_bool() == Some(false) { 3 } else { 0 }
+}
+
+fn run_remote(args: &[String]) -> Result<i32, String> {
+    let c = Client::new(args);
+    let pos = positional(args, 1);
+    let json_out = args.iter().any(|a| a == "--json");
+    let wait_end = |id: &str, timeout_s: f64| -> Result<Value, String> {
+        let start = Instant::now();
+        loop {
+            let s = c.json(&format!("/api/sessions/{id}"))?;
+            if s["state"] == "ended" && s["has_report"] == true {
+                return c.json(&format!("/api/sessions/{id}/report"));
+            }
+            if start.elapsed().as_secs_f64() > timeout_s {
+                return Err(format!("timed out after {timeout_s} s waiting for {id} to end"));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    };
+    let post = |path: &str, body: Value| -> Result<Value, String> {
+        let (code, text) = c.post(path, &body)?;
+        let v: Value = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
+        if code >= 400 {
+            return Err(v["error"].as_str().unwrap_or("error").to_string());
+        }
+        Ok(v)
+    };
+    let timeout: f64 = flag_value(args, "--timeout").and_then(|t| t.parse().ok()).unwrap_or(3600.0);
+    match args[0].as_str() {
+        "check-file" => {
+            let path = pos.first().ok_or("check-file needs a file")?;
+            let abs = std::fs::canonicalize(path.as_str()).unwrap_or_else(|_| PathBuf::from(path.as_str()));
+            let v = post(
+                "/api/check-file",
+                json!({ "path": abs, "profile": flag_value(args, "--profile"), "key": flag_value(args, "--key") }),
+            )?;
+            let report = wait_end(v["id"].as_str().unwrap_or(""), timeout)?;
+            Ok(print_report(&report, json_out))
+        }
+        "pull" => {
+            let url = pos.first().ok_or("pull needs a source: rtsp://…, ndi://… or camera://…")?;
+            let for_s: Option<f64> = flag_value(args, "--for").and_then(|f| f.parse().ok());
+            let v = post(
+                "/api/pull",
+                json!({ "url": url, "key": flag_value(args, "--key"), "profile": flag_value(args, "--profile"), "for_s": for_s }),
+            )?;
+            let id = v["id"].as_str().unwrap_or("").to_string();
+            if args.iter().any(|a| a == "--wait") || for_s.is_some() {
+                let report = wait_end(&id, timeout.max(for_s.unwrap_or(0.0) + 30.0))?;
+                return Ok(print_report(&report, json_out));
+            }
+            println!("{}", json!({ "id": id, "key": v["key"] }));
+            Ok(0)
+        }
+        "sources" => {
+            let kind = pos.first().map_or("camera", |k| k.as_str());
+            let v = c.json(&format!("/api/sources/{kind}"))?;
+            Ok(print_sources(&v, json_out))
+        }
+        other => Err(format!("unknown command '{other}'")),
+    }
+}
+
+fn print_sources(v: &Value, json_out: bool) -> i32 {
+    if json_out {
+        println!("{v}");
+    } else if v["available"] == true {
+        for s in v["sources"].as_array().into_iter().flatten() {
+            println!("{}", s.as_str().unwrap_or(""));
+        }
+    } else {
+        eprintln!("{}", v["error"].as_str().unwrap_or("not available"));
+    }
+    if v["available"] == true { 0 } else { 1 }
+}
+
+async fn run_local(args: &[String]) -> Result<i32, String> {
+    let mut cfg = serve_config(&[])?;
+    if let Some(d) = flag_value(args, "--data") {
+        cfg.data_dir = PathBuf::from(d);
+    }
+    let pos = positional(args, 1);
+    let json_out = args.iter().any(|a| a == "--json");
+    match args[0].as_str() {
+        "sources" => {
+            let kind = pos.first().map_or("camera", |k| k.as_str());
+            Ok(print_sources(&crate::pull::sources(kind).await, json_out))
+        }
+        "check-file" => {
+            let path = pos.first().ok_or("check-file needs a file")?;
+            let hub = crate::hub::Hub::new(cfg);
+            let req = crate::file_check::Request {
+                path: PathBuf::from(path.as_str()),
+                profile: flag_value(args, "--profile").unwrap_or_else(|| "open".into()),
+                key: flag_value(args, "--key"),
+            };
+            let s = crate::file_check::start(&hub, req)?;
+            crate::file_check::ended(&s).await;
+            let report = s.inner.lock().report.clone().unwrap_or_default();
+            Ok(print_report(&report, json_out))
+        }
+        "pull" => {
+            let url = pos.first().ok_or("pull needs a source: rtsp://…, ndi://… or camera://…")?;
+            let hub = crate::hub::Hub::new(cfg);
+            let req = crate::pull::PullRequest {
+                url: url.to_string(),
+                key: flag_value(args, "--key"),
+                profile: flag_value(args, "--profile"),
+                for_s: flag_value(args, "--for").and_then(|f| f.parse().ok()),
+            };
+            let s = crate::pull::start(&hub, req).await?;
+            eprintln!("pulling {url} as session {} (Ctrl-C ends it)", s.id);
+            tokio::select! {
+                _ = crate::file_check::ended(&s) => {}
+                _ = tokio::signal::ctrl_c() => {
+                    crate::pull::stop(&hub, &s, "stopped with Ctrl-C".into()).await;
+                    crate::file_check::ended(&s).await;
+                }
+            }
+            let report = s.inner.lock().report.clone().unwrap_or_default();
+            Ok(print_report(&report, json_out))
+        }
+        other => Err(format!("unknown command '{other}'")),
+    }
 }
 
 /// Runs a command that talks to a running Stream Check. Returns the exit code.

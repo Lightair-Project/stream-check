@@ -30,15 +30,29 @@ pub enum Proto {
     Rtmps,
     Srt,
     Whip,
+    /// A file read from disk (a recording, a replay clip).
+    File,
+    /// An RTSP server the lab plays from.
+    Rtsp,
+    /// An NDI source the lab receives.
+    Ndi,
+    /// A camera on this computer (a virtual camera, say).
+    Camera,
 }
 
 impl Proto {
-    pub fn container(self) -> &'static str {
+    /// What the lab records a connection's media as; none for files (the file is the
+    /// recording) and for uncompressed sources (NDI, cameras), which get thumbnails only.
+    pub fn recording(self) -> Option<&'static str> {
         match self {
-            Proto::Rtmp | Proto::Rtmps => "flv",
-            Proto::Srt => "ts",
-            Proto::Whip => "mkv",
+            Proto::Rtmp | Proto::Rtmps => Some("flv"),
+            Proto::Srt => Some("ts"),
+            Proto::Whip | Proto::Rtsp => Some("mkv"),
+            Proto::File | Proto::Ndi | Proto::Camera => None,
         }
+    }
+    pub fn container(self) -> &'static str {
+        self.recording().unwrap_or("none")
     }
     pub fn name(self) -> &'static str {
         match self {
@@ -46,6 +60,22 @@ impl Proto {
             Proto::Rtmps => "rtmps",
             Proto::Srt => "srt",
             Proto::Whip => "whip",
+            Proto::File => "file",
+            Proto::Rtsp => "rtsp",
+            Proto::Ndi => "ndi",
+            Proto::Camera => "camera",
+        }
+    }
+    /// The lab reads from it, rather than a sender publishing to the lab.
+    pub fn pulled(self) -> bool {
+        matches!(self, Proto::Rtsp | Proto::Ndi | Proto::Camera)
+    }
+    /// "ingest", "pull" or "file": what kind of session this makes.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Proto::File => "file",
+            p if p.pulled() => "pull",
+            _ => "ingest",
         }
     }
 }
@@ -176,9 +206,27 @@ struct Pipeline {
     raw: Option<(File, u64)>,
     helper: Option<mpsc::Sender<Vec<u8>>>,
     ignored_late: bool,
+    /// Nothing to record or decode (files, uncompressed sources).
+    off: bool,
 }
 
 impl Pipeline {
+    fn new() -> Pipeline {
+        Pipeline {
+            video: None,
+            audio: None,
+            pending: vec![],
+            first: None,
+            mkv: None,
+            started: false,
+            file: None,
+            raw: None,
+            helper: None,
+            ignored_late: false,
+            off: false,
+        }
+    }
+
     fn write_mkv(&mut self, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
@@ -219,6 +267,9 @@ impl Pipeline {
     }
 
     fn feed(&mut self, m: &Media, dims: (u32, u32)) -> Option<&'static str> {
+        if self.off {
+            return None;
+        }
         let now = Instant::now();
         let mut note = None;
         match m {
@@ -320,6 +371,18 @@ pub struct Inner {
     pub track_maps: Value,
     /// Each other track's preview start: its config, and its pictures since the last keyframe.
     track_preview: BTreeMap<u8, PreviewStart>,
+    /// What a file or pull session reads from, and what was learnt about it beyond the stats
+    /// (the file's container and tracks, the RTSP server's description, the picture's colours).
+    pub source: Value,
+    /// Problems found about the source itself, for the report's verdict.
+    pub source_problems: Vec<String>,
+    /// The session's clock is the media's own (a file read faster than real time): the lab's
+    /// once-a-second tick leaves it alone, and its reader ticks it.
+    virtual_clock: bool,
+    /// How long the media lasts, when that and not the wall clock is the session's duration.
+    media_duration_s: Option<f64>,
+    /// Why a file or pull session was told to stop (its reader ends with this).
+    stop_reason: Option<String>,
 }
 
 /// A preview's start for a new viewer: its config messages, and its pictures since the last
@@ -328,6 +391,8 @@ type PreviewStart = (Vec<Arc<Vec<u8>>>, Vec<Arc<Vec<u8>>>);
 
 pub struct Session {
     pub id: String,
+    /// "ingest", "pull" or "file".
+    pub kind: &'static str,
     pub platform: String,
     pub app: String,
     pub key: String,
@@ -395,6 +460,16 @@ pub struct Publisher {
 impl Publisher {
     pub fn media(&self, m: Media) {
         self.session.feed(self.conn, m);
+    }
+
+    /// Media whose moment is `now` rather than the wall clock's (a file read faster than real time).
+    pub fn media_at(&self, m: Media, now: Instant) {
+        self.session.feed_at(self.conn, m, now);
+    }
+
+    /// Whether the connection was told to stop (a fault, `end`, the lab closing).
+    pub fn is_killed(&self) -> bool {
+        self.killed.has_changed().unwrap_or(true)
     }
 
     /// Bytes of the container to keep as they came (FLV tags, TS packets).
@@ -564,6 +639,16 @@ impl Hub {
 
     /// A sender asks to publish `app/key`. Says no for a wrong key, a refusing fault or a key already in use.
     pub fn authorize(self: &Arc<Self>, proto: Proto, app: &str, key: &str, remote: SocketAddr) -> Result<Publisher, Refusal> {
+        self.open(proto, app, key, remote, true)
+    }
+
+    /// The lab starts reading a file or pulling from a source, measured against `profile` and
+    /// known by `key`: a session like a sender's, without the stream key rules.
+    pub fn authorize_pull(self: &Arc<Self>, proto: Proto, profile: &str, key: &str, remote: SocketAddr) -> Result<Publisher, Refusal> {
+        self.open(proto, profile, key, remote, false)
+    }
+
+    fn open(self: &Arc<Self>, proto: Proto, app: &str, key: &str, remote: SocketAddr, check_key: bool) -> Result<Publisher, Refusal> {
         let profile = profiles::find(app).unwrap_or_else(|| profiles::find("open").unwrap());
         let platform = profile.name.to_string();
         let now = Instant::now();
@@ -584,7 +669,8 @@ impl Hub {
                 "refusing this stream's connections (injected)".into(),
             ));
         }
-        if let Some(keys) = self.cfg.accept_keys.get(&platform) {
+        if !check_key {
+        } else if let Some(keys) = self.cfg.accept_keys.get(&platform) {
             if !keys.iter().any(|k| k == key) {
                 return Err(self.reject(
                     proto,
@@ -642,7 +728,7 @@ impl Hub {
                 );
                 s
             }
-            None => self.new_session(profile, app, key, slot.clone()),
+            None => self.new_session(profile, app, key, slot.clone(), proto.kind()),
         };
         let proto_known = session.inner.lock().protocols.contains(&proto);
         {
@@ -655,41 +741,39 @@ impl Hub {
             g.connections.push(Connection { id: conn, proto, remote: remote.to_string(), started_s, ended_s: None, end_reason: None });
             g.segment_no += 1;
             let seg = g.segment_no;
-            let file = format!("seg{seg:02}.{}", proto.container());
-            let path = session.dir.join(&file);
-            let mut pipeline = Pipeline {
-                video: None,
-                audio: None,
-                pending: vec![],
-                first: None,
-                mkv: None,
-                started: false,
-                file: None,
-                raw: None,
-                helper: None,
-                ignored_late: false,
-            };
-            match File::create(&path) {
-                Ok(f) => {
-                    if proto == Proto::Whip {
-                        pipeline.file = Some((f, 0, Offsets::default()));
-                    } else {
-                        pipeline.raw = Some((f, 0));
+            let mut pipeline = Pipeline::new();
+            if let Some(ext) = proto.recording() {
+                let file = format!("seg{seg:02}.{ext}");
+                let path = session.dir.join(&file);
+                match File::create(&path) {
+                    Ok(f) => {
+                        if ext == "mkv" {
+                            pipeline.file = Some((f, 0, Offsets::default()));
+                        } else {
+                            pipeline.raw = Some((f, 0));
+                        }
+                    }
+                    Err(e) => {
+                        drop(g);
+                        session.event(Level::Error, "recording", format!("couldn't create {file}: {e}"));
+                        g = session.inner.lock();
                     }
                 }
-                Err(e) => {
-                    drop(g);
-                    session.event(Level::Error, "recording", format!("couldn't create {file}: {e}"));
-                    g = session.inner.lock();
+                if self.cfg.ffmpeg {
+                    pipeline.helper = Some(crate::helper::spawn(session.clone(), seg, session.dir.clone()));
                 }
-            }
-            if self.cfg.ffmpeg {
-                pipeline.helper = Some(crate::helper::spawn(session.clone(), seg, session.dir.clone()));
+                g.segments.push(SegmentInfo { file, container: ext, connection: conn, bytes: 0, started_s, probe: None });
+            } else {
+                pipeline.off = true;
             }
             g.pipeline = pipeline;
-            g.segments.push(SegmentInfo { file, container: proto.container(), connection: conn, bytes: 0, started_s, probe: None });
         }
-        session.event(Level::Info, "connected", format!("{} publisher from {remote}", proto.name().to_uppercase()));
+        let who = match proto.kind() {
+            "file" => format!("reading the file {key}"),
+            "pull" => format!("{} source {key} ({remote})", proto.name().to_uppercase()),
+            _ => format!("{} publisher from {remote}", proto.name().to_uppercase()),
+        };
+        session.event(Level::Info, "connected", who);
         let killed = session.slot.kill.subscribe();
         Ok(Publisher { session, hub: self.clone(), conn, proto, killed, bucket: Instant::now(), ended: false, reason: String::new() })
     }
@@ -698,7 +782,7 @@ impl Hub {
         self.cfg.grace_override.unwrap_or(p.grace_s)
     }
 
-    fn new_session(&self, profile: &'static Profile, app: &str, key: &str, slot: Arc<Slot>) -> Arc<Session> {
+    fn new_session(&self, profile: &'static Profile, app: &str, key: &str, slot: Arc<Slot>, kind: &'static str) -> Arc<Session> {
         let wall = now_ms();
         let base = format!("{}-{}-{}", stamp(wall), profile.name, clean(key));
         let mut id = base.clone();
@@ -712,6 +796,7 @@ impl Hub {
         let t0 = Instant::now();
         let s = Arc::new(Session {
             id,
+            kind,
             platform: profile.name.into(),
             app: app.into(),
             key: key.into(),
@@ -731,18 +816,7 @@ impl Hub {
                 events: vec![],
                 violations: vec![],
                 segments: vec![],
-                pipeline: Pipeline {
-                    video: None,
-                    audio: None,
-                    pending: vec![],
-                    first: None,
-                    mkv: None,
-                    started: false,
-                    file: None,
-                    raw: None,
-                    helper: None,
-                    ignored_late: false,
-                },
+                pipeline: Pipeline::new(),
                 reconnects: 0,
                 grace_uses: 0,
                 protocols: vec![],
@@ -758,6 +832,11 @@ impl Hub {
                 client: Value::Null,
                 track_maps: Value::Null,
                 track_preview: BTreeMap::new(),
+                source: Value::Null,
+                source_problems: vec![],
+                virtual_clock: false,
+                media_duration_s: None,
+                stop_reason: None,
             }),
             preview: broadcast::channel(256).0,
             track_preview: broadcast::channel(512).0,
@@ -768,11 +847,12 @@ impl Hub {
     }
 
     async fn connection_closed(self: &Arc<Self>, s: Arc<Session>, conn: u64, reason: String) {
-        let (grace, epoch) = {
+        let (grace, epoch, pulled) = {
             let mut g = s.inner.lock();
             if g.conn.map(|c| c.0) != Some(conn) {
                 return;
             }
+            let pulled = g.conn.is_some_and(|c| c.1.kind() != "ingest");
             g.conn = None;
             let t = s.t0.elapsed().as_secs_f64();
             if let Some(c) = g.connections.iter_mut().find(|c| c.id == conn) {
@@ -780,7 +860,9 @@ impl Hub {
                 c.end_reason = Some(reason.clone());
             }
             let seg = g.pipeline.finish();
-            if let (Some((bytes, _)), Some(last)) = (seg, g.segments.iter_mut().rev().find(|x| x.connection == conn && !x.file.contains("-track"))) {
+            if let (Some((bytes, _)), Some(last)) =
+                (seg, g.segments.iter_mut().rev().find(|x| x.connection == conn && !x.file.contains("-track")))
+            {
                 last.bytes = bytes;
             }
             for (file, bytes) in g.tracks.finish() {
@@ -788,22 +870,23 @@ impl Hub {
                     x.bytes = bytes;
                 }
             }
-            let grace = self.grace_s(s.profile);
+            // a file or a pulled source is done when it stops: nothing comes back by itself
+            let grace = if pulled { 0 } else { self.grace_s(s.profile) };
             g.last_gone = Some(Instant::now());
             if grace > 0 {
                 g.state = State::Grace;
                 g.grace_until = Some(Instant::now() + Duration::from_secs(grace as u64));
             }
             g.epoch += 1;
-            (grace, g.epoch)
+            (grace, g.epoch, pulled)
         };
         s.event(
-            Level::Warn,
+            if pulled { Level::Info } else { Level::Warn },
             "disconnected",
             format!("{reason}{}", if grace > 0 { format!("; holding the session {grace} s for a reconnect") } else { String::new() }),
         );
         if grace == 0 {
-            self.finalize(s, "the sender is gone".into()).await;
+            self.finalize(s, if pulled { reason } else { "the sender is gone".into() }).await;
             return;
         }
         let hub = self.clone();
@@ -942,17 +1025,67 @@ impl Session {
         self.push_event(&mut g, level, kind, msg.into());
     }
 
+    /// An event at a moment of the session's own clock (a file's media time).
+    pub fn event_at(&self, now: Instant, level: Level, kind: &str, msg: impl Into<String>) {
+        let mut g = self.inner.lock();
+        self.push_event_at(&mut g, now, level, kind, msg.into());
+    }
+
     fn push_event(&self, g: &mut Inner, level: Level, kind: &str, msg: String) {
-        g.events.push(Event { t: self.t0.elapsed().as_secs_f64(), wall_ms: now_ms(), level, kind: kind.into(), msg });
+        self.push_event_at(g, Instant::now(), level, kind, msg);
+    }
+
+    fn push_event_at(&self, g: &mut Inner, now: Instant, level: Level, kind: &str, msg: String) {
+        let t = now.saturating_duration_since(self.t0).as_secs_f64();
+        g.events.push(Event { t, wall_ms: now_ms(), level, kind: kind.into(), msg });
         if g.events.len() > 5000 {
             g.events.remove(0);
         }
     }
 
     fn push_notes(&self, g: &mut Inner, notes: Vec<Note>) {
+        self.push_notes_at(g, notes, Instant::now());
+    }
+
+    fn push_notes_at(&self, g: &mut Inner, notes: Vec<Note>, now: Instant) {
         for n in notes {
-            self.push_event(g, n.level, n.kind, n.msg);
+            self.push_event_at(g, now, n.level, n.kind, n.msg);
         }
+    }
+
+    /// What a file or pull session reads from (replaces what was said before).
+    pub fn set_source(&self, v: Value) {
+        self.inner.lock().source = v;
+    }
+
+    /// Changes what is said about the source.
+    pub fn update_source(&self, f: impl FnOnce(&mut Value)) {
+        f(&mut self.inner.lock().source);
+    }
+
+    /// A problem with the source itself, for the report's verdict.
+    pub fn add_problem(&self, p: impl Into<String>) {
+        let p = p.into();
+        let mut g = self.inner.lock();
+        if !g.source_problems.contains(&p) {
+            g.source_problems.push(p);
+        }
+    }
+
+    /// Sets numbers the analyzer can't see by itself (an uncompressed picture's size, raw sound).
+    pub fn with_stats(&self, f: impl FnOnce(&mut crate::analyze::Stats)) {
+        f(&mut self.inner.lock().analyzer.stats);
+    }
+
+    /// The session runs on its media's clock: [`Session::tick_at`] is called by its reader, not
+    /// by the lab's once-a-second tick.
+    pub fn set_virtual_clock(&self, on: bool) {
+        self.inner.lock().virtual_clock = on;
+    }
+
+    /// How long the media lasts, which is then the session's duration.
+    pub fn set_media_duration(&self, s: f64) {
+        self.inner.lock().media_duration_s = Some(s);
     }
 
     /// What the sender said about itself (Enhanced RTMP capabilities, its key's query).
@@ -961,9 +1094,16 @@ impl Session {
     }
 
     pub fn set_levels(&self, l: Levels) {
+        self.set_levels_at(l, Instant::now());
+    }
+
+    pub fn set_levels_at(&self, l: Levels, now: Instant) {
         let mut g = self.inner.lock();
-        let notes = g.analyzer.set_levels(l, Instant::now());
-        self.push_notes(&mut g, notes);
+        if g.state == State::Ended {
+            return;
+        }
+        let notes = g.analyzer.set_levels(l, now);
+        self.push_notes_at(&mut g, notes, now);
     }
 
     pub fn set_rtp(&self, conn: u64, audio: bool, stats: crate::rtp::RtpStats) {
@@ -1009,7 +1149,10 @@ impl Session {
     }
 
     pub fn feed(&self, conn: u64, m: Media) {
-        let now = Instant::now();
+        self.feed_at(conn, m, Instant::now());
+    }
+
+    pub fn feed_at(&self, conn: u64, m: Media, now: Instant) {
         let mut g = self.inner.lock();
         if g.conn.map(|c| c.0) != Some(conn) {
             return;
@@ -1055,21 +1198,29 @@ impl Session {
         };
         g.tracks.on_track0(&m);
         if let Media::Metadata(v) = &m {
-            self.push_event(&mut g, Level::Info, "metadata", format!("the sender's own description: {v}"));
+            self.push_event_at(&mut g, now, Level::Info, "metadata", format!("the sender's own description: {v}"));
             // Enhanced RTMP's per-track descriptions (trackId 1 and up; 0 is the fields above)
             let maps = json!({ "video": v.get("videoTrackIdInfoMap"), "audio": v.get("audioTrackIdInfoMap") });
             if !maps["video"].is_null() || !maps["audio"].is_null() {
-                self.push_event(&mut g, Level::Info, "metadata-tracks", format!("track maps: video {}, audio {}", maps["video"], maps["audio"]));
+                self.push_event(
+                    &mut g,
+                    Level::Info,
+                    "metadata-tracks",
+                    format!("track maps: video {}, audio {}", maps["video"], maps["audio"]),
+                );
                 g.track_maps = maps;
             }
         }
         let notes = g.analyzer.on_media(&m, now);
-        self.push_notes(&mut g, notes);
+        self.push_notes_at(&mut g, notes, now);
         let dims = g.analyzer.stats.video.sps.as_ref().map_or((0, 0), |s| (s.width, s.height));
         if let Some(n) = g.pipeline.feed(&m, dims) {
             self.push_event(&mut g, Level::Warn, "recording", n.into());
         }
-        // the browser preview
+        // the browser preview (an uncompressed source's pictures are only counted: nothing to show)
+        if matches!(&m, Media::Video { data, .. } | Media::Audio { data, .. } if data.is_empty()) {
+            return;
+        }
         let msg = preview_message(&m, &g.analyzer);
         if let Some(msg) = msg {
             let msg = Arc::new(msg);
@@ -1110,18 +1261,36 @@ impl Session {
         self.slot.kill.send_modify(|n| *n += 1);
     }
 
+    /// Tells a file or pull session's reader to stop, and why.
+    pub fn stop_with(&self, reason: impl Into<String>) {
+        self.inner.lock().stop_reason = Some(reason.into());
+        self.kill();
+    }
+
+    /// Why the session was told to stop: `end`, the time asked for, or else a fault's drop.
+    pub fn stop_reason(&self) -> String {
+        self.inner.lock().stop_reason.clone().unwrap_or_else(|| "dropped (a fault)".into())
+    }
+
     fn tick(&self) {
-        let now = Instant::now();
+        if self.inner.lock().virtual_clock {
+            return;
+        }
+        self.tick_at(Instant::now());
+    }
+
+    /// The once-a-second work (derived numbers, graphs, platform rules) as of `now`.
+    pub fn tick_at(&self, now: Instant) {
         let mut g = self.inner.lock();
         if g.state == State::Ended {
             return;
         }
         if g.state == State::Live {
             let notes = g.analyzer.tick(now);
-            self.push_notes(&mut g, notes);
+            self.push_notes_at(&mut g, notes, now);
             let fps0 = g.analyzer.stats.video.fps;
             let notes = g.tracks.tick(now, fps0);
-            self.push_notes(&mut g, notes);
+            self.push_notes_at(&mut g, notes, now);
             let seconds = now.duration_since(self.t0).as_secs_f64();
             let mut found = profiles::check(self.profile, &g.analyzer.stats, seconds);
             found.extend(profiles::check_tracks(self.profile, &g.analyzer.stats, &g.tracks.stats(), seconds));
@@ -1137,7 +1306,7 @@ impl Session {
                             rec.active = true;
                             rec.count += 1;
                             let m = v.msg.clone();
-                            self.push_event(&mut g, v.level, "violation", format!("{}: {m}", v.rule));
+                            self.push_event_at(&mut g, now, v.level, "violation", format!("{}: {m}", v.rule));
                         }
                     }
                     None => {
@@ -1150,7 +1319,7 @@ impl Session {
                             active: true,
                             count: 1,
                         });
-                        self.push_event(&mut g, v.level, "violation", format!("{}: {}", v.rule, v.msg));
+                        self.push_event_at(&mut g, now, v.level, "violation", format!("{}: {}", v.rule, v.msg));
                     }
                 }
             }
@@ -1162,7 +1331,7 @@ impl Session {
                 }
             }
             for r in cleared {
-                self.push_event(&mut g, Level::Info, "violation-cleared", format!("{r}: back within the rules"));
+                self.push_event_at(&mut g, now, Level::Info, "violation-cleared", format!("{r}: back within the rules"));
             }
         }
     }
@@ -1170,17 +1339,19 @@ impl Session {
     pub fn summary(&self, detail: bool) -> Value {
         let g = self.inner.lock();
         let now = Instant::now();
-        let dur = match (g.state, g.ended_wall_ms) {
-            (State::Ended, Some(e)) => (e - self.started_wall_ms) as f64 / 1000.0,
+        let dur = match (g.state, g.ended_wall_ms, g.media_duration_s) {
+            (_, _, Some(d)) => d,
+            (State::Ended, Some(e), _) => (e - self.started_wall_ms) as f64 / 1000.0,
             _ => now.duration_since(self.t0).as_secs_f64(),
         };
         let conn = g.conn.map(|(id, p, r)| json!({"id": id, "protocol": p, "remote": r.to_string()}));
         // the bytes of the recording being written now
         let mut segments = g.segments.clone();
         if g.conn.is_some() {
-            if let (Some(last), Some(n)) =
-                (segments.iter_mut().rev().find(|x| !x.file.contains("-track")), g.pipeline.raw.as_ref().map(|r| r.1).or(g.pipeline.file.as_ref().map(|f| f.1)))
-            {
+            if let (Some(last), Some(n)) = (
+                segments.iter_mut().rev().find(|x| !x.file.contains("-track")),
+                g.pipeline.raw.as_ref().map(|r| r.1).or(g.pipeline.file.as_ref().map(|f| f.1)),
+            ) {
                 last.bytes = n;
             }
             for (file, n) in g.tracks.recording_bytes() {
@@ -1191,6 +1362,8 @@ impl Session {
         }
         let mut v = json!({
             "id": self.id,
+            "kind": self.kind,
+            "source": g.source,
             "platform": self.platform,
             "profile": self.profile,
             "app": self.app,
@@ -1251,8 +1424,10 @@ impl Session {
     pub fn build_report(&self) -> Value {
         let g = self.inner.lock();
         let st = &g.analyzer.stats;
-        let dur = g.ended_wall_ms.map_or(self.t0.elapsed().as_secs_f64(), |e| (e - self.started_wall_ms) as f64 / 1000.0);
-        let mut problems: Vec<String> = vec![];
+        let dur = g
+            .media_duration_s
+            .unwrap_or_else(|| g.ended_wall_ms.map_or(self.t0.elapsed().as_secs_f64(), |e| (e - self.started_wall_ms) as f64 / 1000.0));
+        let mut problems: Vec<String> = g.source_problems.clone();
         for v in &g.violations {
             if v.level == Level::Error {
                 problems.push(format!("rule broken: {} ({})", v.rule, v.msg));
@@ -1277,6 +1452,8 @@ impl Session {
         let series: Vec<_> = g.analyzer.series.iter().step_by(((g.analyzer.series.len() / 600) + 1).max(1)).cloned().collect();
         json!({
             "id": self.id,
+            "kind": self.kind,
+            "source": g.source,
             "ok": problems.is_empty(),
             "problems": problems,
             "platform": self.platform,
