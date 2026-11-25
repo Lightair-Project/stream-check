@@ -1388,6 +1388,7 @@ impl Session {
             "faults": self.slot.faults.lock().describe(now),
             "segments": segments,
             "has_report": g.report.is_some(),
+            "srt": crate::srt_stats::stats_json(self, if detail { 900 } else { 120 }),
         });
         if detail {
             let series: Vec<_> = g.analyzer.series.iter().rev().take(900).rev().cloned().collect();
@@ -1476,6 +1477,7 @@ impl Session {
             "segments": g.segments,
             "thumbs": thumbs,
             "series": series,
+            "srt": crate::srt_stats::stats_json(self, 0),
             "events": g.events,
             "directory": self.dir,
         })

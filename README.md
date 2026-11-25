@@ -211,6 +211,11 @@ The analyzer reads the H.264 and HEVC bitstream of every track (track 0 in `stat
   MaxBR by tier, the picture buffer). The frame rate is the measured one (3% slack), the bitrate the peak over 2 s
   (10% slack), so they are a strong hint, not a conformance test.
 
+SRT sessions carry `srt`: the link agreed in the handshake (receive latency, round trip at the handshake, flow window,
+encryption), packets received, recovered by retransmission or reordering, and dropped too late, loss and drop shares
+over the session and the last 5 s, receive rate, a per-second series, and warnings when loss passes 2% or any packet
+is dropped. srt-tokio doesn't measure the round trip after the handshake.
+
 ## Fault injection
 
 Per stream key (the same key on any platform), or `*` for every stream; from the UI buttons, the API or the CLI.
