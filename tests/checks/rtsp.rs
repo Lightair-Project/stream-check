@@ -202,8 +202,6 @@ async fn a_pulled_rtsp_stream_is_measured_like_an_ingest() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "bug: a picture-only Matroska recording waits 1.5 s of wall clock for sound, and Pipeline::finish \
-            (src/hub.rs) drops what it held: a pull or WHIP session that ends sooner has an empty seg01.mkv"]
 async fn a_short_picture_only_pull_is_still_recorded() {
     if !have_ffmpeg() {
         eprintln!("no ffmpeg: skipped");

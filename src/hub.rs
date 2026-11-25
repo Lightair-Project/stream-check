@@ -187,11 +187,13 @@ pub struct SegmentInfo {
     pub checked: bool,
     /// ffprobe's own first error line, when it couldn't read the recording.
     pub probe_error: Option<String>,
+    /// Whether pictures or sound came while it was written (an empty one is then a problem).
+    pub had_media: bool,
 }
 
 impl SegmentInfo {
     fn new(file: String, container: &'static str, connection: u64, started_s: f64) -> SegmentInfo {
-        SegmentInfo { file, container, connection, bytes: 0, started_s, probe: None, checked: false, probe_error: None }
+        SegmentInfo { file, container, connection, bytes: 0, started_s, probe: None, checked: false, probe_error: None, had_media: false }
     }
 }
 
@@ -218,6 +220,8 @@ struct Pipeline {
     raw: Option<(File, u64)>,
     helper: Option<mpsc::Sender<Vec<u8>>>,
     ignored_late: bool,
+    /// Pictures or sound came to be recorded.
+    got_media: bool,
     /// Nothing to record or decode (files, uncompressed sources).
     off: bool,
 }
@@ -235,6 +239,7 @@ impl Pipeline {
             raw: None,
             helper: None,
             ignored_late: false,
+            got_media: false,
             off: false,
         }
     }
@@ -306,6 +311,7 @@ impl Pipeline {
                 }
             }
             Media::Video { .. } | Media::Audio { .. } => {
+                self.got_media = true;
                 if !self.started {
                     self.first.get_or_insert(now);
                     self.pending.push(m.clone());
@@ -322,8 +328,13 @@ impl Pipeline {
         note
     }
 
-    /// Closes the files; the recording's bytes and the container's duration.
-    fn finish(&mut self) -> Option<(u64, u64)> {
+    /// Closes the files; the recording's bytes, and whether media came for it.
+    fn finish(&mut self) -> Option<(u64, bool)> {
+        // a connection that ended before its sound came (or before 1.5 s passed) still records
+        // what it held, picture only (or sound only)
+        if !self.started && !self.off && !self.pending.is_empty() && (self.video.is_some() || self.audio.is_some()) {
+            self.start();
+        }
         if let Some(m) = &mut self.mkv {
             let tail = m.flush();
             self.write_mkv(tail);
@@ -336,11 +347,11 @@ impl Pipeline {
                 let _ = mkv::patch(&mut f, o, len, dur);
             }
             let _ = f.flush();
-            size = Some((len, dur as u64));
+            size = Some((len, self.got_media));
         }
         if let Some((mut f, len)) = self.raw.take() {
             let _ = f.flush();
-            size = Some((len, dur as u64));
+            size = Some((len, self.got_media));
         }
         size
     }
@@ -889,10 +900,11 @@ impl Hub {
             }
             g.connection_ended();
             let seg = g.pipeline.finish();
-            if let (Some((bytes, _)), Some(last)) =
+            if let (Some((bytes, media)), Some(last)) =
                 (seg, g.segments.iter_mut().rev().find(|x| x.connection == conn && !x.file.contains("-track")))
             {
                 last.bytes = bytes;
+                last.had_media = media;
             }
             for (file, bytes) in g.tracks.finish() {
                 if let Some(x) = g.segments.iter_mut().find(|x| x.file == file) {
@@ -945,8 +957,9 @@ impl Hub {
             if g.conn.take().is_some() {
                 g.connection_ended();
                 let seg = g.pipeline.finish();
-                if let (Some((bytes, _)), Some(last)) = (seg, g.segments.iter_mut().rev().find(|x| !x.file.contains("-track"))) {
+                if let (Some((bytes, media)), Some(last)) = (seg, g.segments.iter_mut().rev().find(|x| !x.file.contains("-track"))) {
                     last.bytes = bytes;
+                    last.had_media = media;
                 }
                 for (file, bytes) in g.tracks.finish() {
                     if let Some(x) = g.segments.iter_mut().find(|x| x.file == file) {
@@ -1505,6 +1518,10 @@ impl Session {
         for s in &g.segments {
             if let Some(e) = &s.probe_error {
                 problems.push(format!("{} doesn't play: ffprobe says \"{e}\"", s.file));
+            } else if s.container == "mkv" && s.had_media && s.bytes == 0 {
+                // the lab writes Matroska from the media it was given (FLV and TS are the bytes as
+                // they came), so an empty one lost what it was given
+                problems.push(format!("{} is empty although media arrived: nothing was recorded", s.file));
             }
         }
         let unchecked: Vec<&str> = g.segments.iter().filter(|s| !s.checked && s.probe_error.is_none()).map(|s| s.file.as_str()).collect();

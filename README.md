@@ -366,7 +366,9 @@ thumbnails with their times, and the event log. Stalls, gaps and reconnects are 
 ffprobe reads the recordings when the session ends. A report taken earlier (a live session, or one waiting
 in its grace period) lists them in `recordings_not_checked` and doesn't count them against the verdict; once
 checked, each segment has `checked`, and a recording ffprobe can't read has `probe_error` (ffprobe's own first
-error line), which is a problem.
+error line), which is a problem. A Matroska recording (WHIP, RTSP) waits up to 1.5 s for both picture and
+sound before it starts; a connection that ends sooner is recorded with what it had (picture only, say), and a
+Matroska recording left empty although media arrived is a problem.
 
 ## How it works, and what it can't tell you
 
