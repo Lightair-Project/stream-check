@@ -220,7 +220,7 @@ function makeCard(s0) {
     stat("video", "Video"), stat("res", "Resolution"), stat("fps", "Frame rate"), stat("vbr", "Video bitrate"), stat("key", "Keyframe interval"), stat("gop", "GOP"),
     stat("ts", "Timestamps"), stat("stall", "Stalls"), stat("av", "A/V offset"), stat("drift", "A/V drift"),
     stat("audio", "Audio"), stat("loud", "Loudness (M / S / I)"), stat("sil", "Silence"), stat("rtp", "RTP (lost / repaired / late)"),
-    stat("colour", "Colour"), stat("bits", "Bitstream"), stat("bpm", "Performance metrics (BPM)"), stat("lat", "Latency (sender clock)"), stat("cc", "Captions"),
+    stat("colour", "Colour"), stat("bits", "Bitstream"), stat("bpm", "Performance metrics (BPM)"), stat("lat", "Latency (sender clock)"), stat("cc", "Captions"), stat("enc", "Encoder (user data)"),
     stat("srtloss", "SRT loss (missing / recovered / dropped)"), stat("srtlat", "SRT latency · round trip"), stat("srtrx", "SRT receive"), stat("srtlink", "SRT link"),
     stat("sess", "Session"));
   const viol = el("div", { class: "viol" });
@@ -444,8 +444,9 @@ function makeCard(s0) {
     if (col) {
       const names = [col.primaries_name, col.transfer_name, col.matrix_name].filter(Boolean);
       const range = col.full_range == null ? (names.length ? "range not tagged" : "") : col.full_range ? "full range" : "limited range";
-      const depth = sps.bit_depth_luma ? `${sps.bit_depth_luma}-bit` : "";
-      set("colour", [names.length ? [...new Set(names)].join(" / ") : "not tagged", range, depth].filter(Boolean).join(" · "), bs && bs.colour_warnings && bs.colour_warnings.length ? "warn" : "",
+      const depth = sps.bit_depth ? `${sps.bit_depth}-bit${sps.bit_depth_chroma && sps.bit_depth_chroma !== sps.bit_depth ? "/" + sps.bit_depth_chroma : ""}` : "";
+      const chroma = { 0: "mono", 1: "4:2:0", 2: "4:2:2", 3: "4:4:4" }[sps.chroma_format] || "";
+      set("colour", [names.length ? [...new Set(names)].join(" / ") : "not tagged", range, [depth, chroma].filter(Boolean).join(" ")].filter(Boolean).join(" · "), bs && bs.colour_warnings && bs.colour_warnings.length ? "warn" : "",
         `primaries ${col.primaries ?? "–"}, transfer ${col.transfer ?? "–"}, matrix ${col.matrix ?? "–"}${col.chroma_loc_top != null ? ", chroma location " + col.chroma_loc_top : ""}${sps.vui === false ? " (no VUI)" : ""}`);
     } else hide("colour");
     if (bs) {
@@ -458,6 +459,9 @@ function makeCard(s0) {
          sei.length ? "SEI: " + sei.map(([k, n]) => `${k} ×${n}`).join(", ") : "no SEI",
          ...(bs.user_data || []).map(u => `user data ${u.uuid} ×${u.count}${u.text ? ": " + u.text : ""}`)].join("\n"));
     } else hide("bits");
+    const ud = ((bs && bs.user_data) || []).filter(u => u.text);
+    if (ud.length) set("enc", ud.map(u => u.text.split(/\s+options:/)[0].split(" - ").slice(0, 2).join(" ").slice(0, 60)).join(" · "), "", ud.map(u => `${u.uuid}: ${u.text}`).join("\n\n"));
+    else hide("enc");
     const bt = bpmText(v.bpm);
     if (bt) {
       const b = v.bpm, se = b.session, re = b.rendition;
@@ -497,7 +501,7 @@ function makeCard(s0) {
     if (!vdec && s.thumbs.length) { still.src = `/media/${encodeURIComponent(s.id)}/thumbs/${s.thumbs[s.thumbs.length - 1].file}`; canvas.style.display = "none"; msg.style.display = "none"; } else canvas.style.display = "";
     if (s.state === "ended" && !vdec) { if (!s.thumbs.length) status("session ended"); }
     set("video", sps ? `${v.codec ? v.codec.toUpperCase() : ""} ${sps.profile} @ ${sps.level}` : "–");
-    set("res", sps ? `${sps.width}×${sps.height}` : "–");
+    set("res", sps ? `${sps.width}×${sps.height}${sps.interlaced ? " interlaced" : ""}` : "–", sps && sps.interlaced ? "warn" : "");
     set("fps", v.fps ? `${fmt(v.fps)}${sps && sps.declared_fps ? " (declares " + fmt(sps.declared_fps) + ")" : ""}` : "–");
     set("vbr", v.kbps ? `${fmt(v.kbps, 0)} kbps (peak ${fmt(v.peak_kbps, 0)})` : "–");
     set("key", v.keyint_last_s != null ? `${fmt(v.keyint_last_s, 2)} s (min ${fmt(v.keyint_min_s, 2)}, max ${fmt(v.keyint_max_s, 2)})` : (v.since_key_s != null ? `first, ${fmt(v.since_key_s, 1)} s in` : "–"), v.keyint_max_s > 4 ? "warn" : "");
