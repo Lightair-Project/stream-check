@@ -399,7 +399,10 @@ impl WhipState {
             .with_interceptor_registry(registry)
             .with_handler(Arc::new(Handler { gathered: gathered_tx, state: state_tx, tracks: track_tx }))
             .with_runtime(runtime)
-            .with_udp_addrs(vec!["0.0.0.0:0".to_string()])
+            // the machine's addresses, and loopback too: gathering on 0.0.0.0 leaves loopback out,
+            // and on Windows a sender bound to 127.0.0.1 can't reach the LAN address (nor can
+            // anyone on a machine with no network)
+            .with_udp_addrs(vec!["0.0.0.0:0".to_string(), "127.0.0.1:0".to_string()])
             .build()
             .await
             .map_err(e)?;
