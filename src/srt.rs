@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use srt_protocol::options::KeySize;
+use srt_protocol::options::{ByteCount, KeySize};
 use srt_protocol::settings::{KeySettings, Passphrase};
 use srt_tokio::SrtListener;
 
@@ -36,8 +36,14 @@ pub fn parse_stream_id(id: &str) -> (String, String, Option<String>) {
     }
 }
 
+/// The listener's UDP receive buffer. srt-tokio asks for 64 KB, about 48 datagrams: a keyframe sent
+/// at once overflows it (on Windows a burst of 100 datagrams lost most of them, then SRT spent the
+/// latency budget retransmitting). 8 MB holds over a second of a 50 Mb/s stream.
+pub const UDP_RECV_BUFFER: u64 = 8 * 1024 * 1024;
+
 pub async fn listen(hub: Arc<Hub>, bind: std::net::SocketAddr) -> std::io::Result<()> {
-    let (listener, mut incoming) = SrtListener::builder().bind(bind).await?;
+    let (listener, mut incoming) =
+        SrtListener::builder().set(|o| o.connect.udp_recv_buffer_size = ByteCount(UDP_RECV_BUFFER)).bind(bind).await?;
     let lab_latency_ms = listener.settings().recv_latency.as_millis() as u64;
     while let Some(request) = incoming.incoming().next().await {
         let id = request.stream_id().map(|s| s.to_string()).unwrap_or_default();

@@ -161,3 +161,92 @@ async fn the_report_and_the_sessions_json_carry_the_srt_link_statistics() {
     assert!(report["srt"]["total"]["fault_dropped"].as_u64() > Some(0), "{}", report["srt"]);
     assert!(s.summary(false)["srt"].is_object(), "the web UI's `srt`");
 }
+
+/// A sender that writes the stream in two halves, each at once (hundreds of datagrams back to
+/// back, like a big keyframe handed over whole), with a send buffer that holds them (srt-tokio's
+/// default holds 32 datagrams and stalls the sender for good when more wait). The lab's UDP
+/// receive buffer takes the bursts whole: nothing goes missing, nothing needs retransmitting.
+#[tokio::test(flavor = "multi_thread")]
+async fn bursts_of_hundreds_of_datagrams_arrive_whole() {
+    if !stream_check::helper::ffmpeg_available() {
+        eprintln!("no ffmpeg: skipped");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("t.ts");
+    assert!(make_ts(&file));
+    let ts = std::fs::read(&file).unwrap();
+    let mut cfg = Config::for_test(dir.path().join("data"));
+    cfg.grace_override = Some(1);
+    let lab = start(cfg).await.unwrap();
+    let addr = format!("127.0.0.1:{}", lab.srt.port());
+    let key = "srt-bursts";
+    let mut socket = SrtSocket::builder()
+        .latency(Duration::from_millis(120))
+        .set(|o| o.sender.buffer_size = srt_tokio::options::ByteCount(16 * 1024 * 1024))
+        .call(addr.as_str(), Some(&format!("open/{key}")))
+        .await
+        .unwrap();
+    let chunks: Vec<&[u8]> = ts.chunks(1316).collect();
+    let per_burst = chunks.len() / 2 + 1;
+    for burst in chunks.chunks(per_burst) {
+        for chunk in burst {
+            socket.send((Instant::now(), Bytes::copy_from_slice(chunk))).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+    }
+    socket.close().await.unwrap();
+    let s = lab.hub.find(key).expect("a session");
+    let end = Instant::now() + Duration::from_secs(20);
+    while s.inner.lock().state != State::Ended {
+        assert!(Instant::now() < end, "the session didn't end");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let stats = stream_check::srt_stats::stats_json(&s, 0);
+    assert!(per_burst > 200, "bursts of {per_burst}");
+    assert_eq!(stats["total"]["unique"].as_u64(), Some(chunks.len() as u64), "{}", stats["total"]);
+    assert_eq!(stats["total"]["missing"].as_u64(), Some(0), "{}", stats["total"]);
+    let report = s.inner.lock().report.clone().unwrap();
+    assert!(report["stats"]["video"]["frames"].as_u64() > Some(140), "{}", report["stats"]["video"]["frames"]);
+}
+
+/// An srt-tokio sender with its default send buffer (32 datagrams) handed a burst of hundreds:
+/// srt-protocol 0.4 drops the unsent ones without moving its send pointer and never sends data
+/// again, though the connection stays open. The lab says so and the report fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sender_that_stops_sending_on_an_open_connection_is_a_problem() {
+    if !stream_check::helper::ffmpeg_available() {
+        eprintln!("no ffmpeg: skipped");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("t.ts");
+    assert!(make_ts(&file));
+    let ts = std::fs::read(&file).unwrap();
+    let mut cfg = Config::for_test(dir.path().join("data"));
+    cfg.grace_override = Some(1);
+    let lab = start(cfg).await.unwrap();
+    let addr = format!("127.0.0.1:{}", lab.srt.port());
+    let key = "srt-stalled";
+    let mut socket =
+        SrtSocket::builder().latency(Duration::from_millis(120)).call(addr.as_str(), Some(&format!("open/{key}"))).await.unwrap();
+    for chunk in ts.chunks(1316).take(300) {
+        socket.send((Instant::now(), Bytes::copy_from_slice(chunk))).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let s = lab.hub.find(key).expect("a session");
+    assert!(s.inner.lock().events.iter().any(|e| e.kind == "srt" && e.msg.contains("stopped sending")), "the stall is said");
+    drop(socket);
+    let end = Instant::now() + Duration::from_secs(30);
+    while s.inner.lock().state != State::Ended {
+        assert!(Instant::now() < end, "the session didn't end");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let report = s.inner.lock().report.clone().unwrap();
+    assert_eq!(report["ok"], false);
+    assert!(
+        report["problems"].as_array().unwrap().iter().any(|p| p.as_str().is_some_and(|p| p.contains("stopped sending"))),
+        "{}",
+        report["problems"]
+    );
+}

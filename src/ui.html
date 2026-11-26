@@ -470,7 +470,7 @@ function makeCard(s0) {
     const t = x.total, l = x.link || {}, th = x.thresholds || {};
     set("srtloss", `${t.missing} / ${t.recovered} / ${t.dropped} · ${fmt(x.loss_pct, 2)}%${x.connected ? ` (${fmt(x.window_loss_pct, 1)}% now)` : ""}`,
       x.drop_warning ? "bad" : x.loss_warning ? "warn" : t.dropped ? "warn" : "",
-      `Packets missing on first arrival: ${t.missing} (${fmt(x.loss_pct, 2)}% of ${t.unique + t.missing}), of which ${t.recovered} filled their gap in time (retransmitted or reordered) and ${t.dropped} were dropped too late to play (${fmt(x.drop_pct, 2)}%).`
+      `Packets missing on first arrival: ${t.missing} (${fmt(x.loss_pct, 2)}% of ${t.unique + t.missing}), of which ${t.recovered} filled their gap in time (retransmitted or reordered) and ${t.dropped} were dropped too late to play (${fmt(x.drop_pct, 2)}%). ${t.late || 0} arrived after their place was played (retransmissions that weren't needed: not loss).`
       + ` Over the last ${th.window_s} s: ${fmt(x.window_loss_pct, 2)}% missing, ${x.window_dropped} dropped. Warns above ${th.loss_warn_pct}% loss and on any drop.`
       + ` ${t.naks_sent} loss report(s) (NAK) sent.${t.fault_dropped ? ` ${t.fault_dropped} datagram(s) thrown away by the loss fault after SRT.` : ""}${t.decrypt_errors ? ` ${t.decrypt_errors} could not be decrypted.` : ""}`);
     const rtt = l.handshake_rtt_ms, lat = l.latency_ms, tight = rtt != null && lat != null && lat < 4 * rtt;

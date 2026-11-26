@@ -1514,6 +1514,7 @@ impl Session {
             problems.push("no media ever arrived".into());
         }
         problems.extend(g.tracks.problems());
+        problems.extend(crate::srt_stats::problems(self));
         // a recording counts once ffprobe has looked at it (when the session ends), not before
         for s in &g.segments {
             if let Some(e) = &s.probe_error {

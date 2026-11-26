@@ -233,7 +233,12 @@ The analyzer reads the H.264 and HEVC bitstream of every track (track 0 in `stat
 SRT sessions carry `srt`: the link agreed in the handshake (receive latency, round trip at the handshake, flow window,
 encryption), packets received, recovered by retransmission or reordering, and dropped too late, loss and drop shares
 over the session and the last 5 s, receive rate, a per-second series, and warnings when loss passes 2% or any packet
-is dropped. srt-tokio doesn't measure the round trip after the handshake.
+is dropped. srt-tokio doesn't measure the round trip after the handshake. The listener asks for an 8 MB UDP
+receive buffer (srt-tokio's default, 64 KB, loses most of a keyframe sent at once). A connection that stays open
+while no data packet arrives for 3 s is said (`srt.silent_warning`, counted in `srt.silences`) and is a problem:
+the sender stopped sending. An srt-tokio sender
+does that for good when more datagrams wait than its send buffer holds (32 by default; set the sender's
+`buffer_size`, e.g. 16 MB).
 
 ## Fault injection
 

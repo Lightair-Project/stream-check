@@ -26,6 +26,9 @@ pub const LOSS_CLEAR_PCT: f64 = 1.0;
 pub const WINDOW_S: f64 = 5.0;
 /// Seconds without drops before the drop warning is cleared.
 pub const DROP_CLEAR_S: f64 = 15.0;
+/// Seconds without a data packet, the connection still open, before the sender is said to have
+/// gone quiet.
+pub const SILENT_S: f64 = 3.0;
 /// Samples kept for the time series (one a second).
 const MAX_SAMPLES: usize = 7200;
 /// Samples a report keeps at most (the series is thinned to fit).
@@ -67,8 +70,12 @@ pub struct SrtCounters {
     pub unique: u64,
     /// Packets that arrived late (retransmitted or reordered) and filled their gap in time.
     pub recovered: u64,
-    /// Packets given up on (too late to play) or arriving after they were given up on.
+    /// Packets given up on: too late to play.
     pub dropped: u64,
+    /// Packets that arrived after their place had been played or given up on: retransmissions that
+    /// weren't needed (the first copy had arrived; the sender's retransmission timer fired before
+    /// the acknowledgement reached it, as under load) or came too late. Not loss.
+    pub late: u64,
     /// Packets missing on first arrival: recovered plus dropped.
     pub missing: u64,
     /// Transport stream datagrams the lab threw away after SRT (the `loss` fault).
@@ -85,12 +92,20 @@ pub struct SrtCounters {
 
 impl SrtCounters {
     fn from_socket(s: &SocketStatistics, fault_dropped: u64) -> Self {
+        // srt-protocol counts a packet arriving after its place was released (a needless
+        // retransmission of a packet already played, say) as dropped, like one given up on.
+        // Arrivals that were neither first-time nor gap-filling are those (or duplicates still in
+        // the buffer, which aren't counted as dropped): taken out of the drops.
+        let extra = s.rx_data.saturating_sub(s.rx_unique_data + s.rx_retransmit_data + s.rx_decrypt_errors);
+        let late = extra.min(s.rx_dropped_data);
+        let dropped = s.rx_dropped_data - late;
         SrtCounters {
             packets: s.rx_data,
             unique: s.rx_unique_data,
             recovered: s.rx_retransmit_data,
-            dropped: s.rx_dropped_data,
-            missing: s.rx_retransmit_data + s.rx_dropped_data,
+            dropped,
+            late,
+            missing: s.rx_retransmit_data + dropped,
             fault_dropped,
             decrypt_errors: s.rx_decrypt_errors,
             naks_sent: s.tx_nak,
@@ -106,6 +121,7 @@ impl SrtCounters {
             unique: self.unique + o.unique,
             recovered: self.recovered + o.recovered,
             dropped: self.dropped + o.dropped,
+            late: self.late + o.late,
             missing: self.missing + o.missing,
             fault_dropped: self.fault_dropped + o.fault_dropped,
             decrypt_errors: self.decrypt_errors + o.decrypt_errors,
@@ -123,6 +139,7 @@ impl SrtCounters {
             unique: self.unique.saturating_sub(o.unique),
             recovered: self.recovered.saturating_sub(o.recovered),
             dropped: self.dropped.saturating_sub(o.dropped),
+            late: self.late.saturating_sub(o.late),
             missing: self.missing.saturating_sub(o.missing),
             fault_dropped: self.fault_dropped.saturating_sub(o.fault_dropped),
             decrypt_errors: self.decrypt_errors.saturating_sub(o.decrypt_errors),
@@ -200,6 +217,13 @@ pub struct SrtStats {
     decrypt_warned: u64,
     #[serde(skip)]
     last_drop_t: f64,
+    /// The connection is open but no data packet arrived in the last `SILENT_S` seconds.
+    pub silent_warning: bool,
+    /// Times a sender went quiet that way, over the session.
+    pub silences: u32,
+    /// When the latest connection's last data packet arrived (or it opened).
+    #[serde(skip)]
+    last_data_t: f64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -225,6 +249,8 @@ impl SrtStats {
         self.current = SrtCounters::default();
         self.last = None;
         self.window.clear();
+        self.last_data_t = link.started_s;
+        self.silent_warning = false;
         self.link = Some(link);
     }
 
@@ -251,6 +277,10 @@ impl SrtStats {
         self.total = self.earlier.add(now);
         self.loss_pct = self.total.loss_pct();
         self.drop_pct = self.total.drop_pct();
+        let arrived = now.packets > self.last.map_or(0, |(_, c)| c.packets);
+        if arrived {
+            self.last_data_t = t;
+        }
         let Some((t0, before)) = self.last.replace((t, now)) else { return out };
         let dt = t - t0;
         if dt <= 0.0 {
@@ -309,6 +339,26 @@ impl SrtStats {
             self.drop_warning = false;
             out.push((Level::Info, format!("SRT: no packets dropped in the last {DROP_CLEAR_S:.0} s")));
         }
+        if arrived {
+            if self.silent_warning {
+                self.silent_warning = false;
+                out.push((Level::Info, "SRT: data packets are arriving again".to_string()));
+            }
+        } else if !self.silent_warning && t - self.last_data_t >= SILENT_S {
+            self.silent_warning = true;
+            self.silences += 1;
+            let what = if now.packets == 0 {
+                "no data packet has arrived since it opened".to_string()
+            } else {
+                format!("no data packet has arrived for {:.0} s, after {} packet(s)", t - self.last_data_t, now.packets)
+            };
+            out.push((
+                Level::Warn,
+                format!(
+                    "SRT: the connection is open (the sender answers) but {what}: the sender stopped sending.                      An srt-tokio sender does this for good when more datagrams wait than its send buffer holds                      (32 by default): it drops the unsent ones and never sends again; give it a larger sender buffer_size"
+                ),
+            ));
+        }
         if self.total.decrypt_errors > self.decrypt_warned {
             out.push((Level::Warn, format!("SRT: {} packet(s) could not be decrypted", self.total.decrypt_errors - self.decrypt_warned)));
             self.decrypt_warned = self.total.decrypt_errors;
@@ -355,6 +405,19 @@ pub fn stats_json(session: &Session, samples: usize) -> Value {
     s.map_or(Value::Null, |s| s.lock().to_json(samples))
 }
 
+/// The report's problems from the session's SRT statistics.
+pub fn problems(session: &Session) -> Vec<String> {
+    let s = REGISTRY.lock().iter().find(|(w, _)| std::ptr::eq(w.as_ptr(), session)).map(|(_, s)| s.clone());
+    let Some(s) = s else { return vec![] };
+    let n = s.lock().silences;
+    if n == 0 {
+        return vec![];
+    }
+    vec![format!(
+        "the SRT sender stopped sending {n} time(s) while its connection stayed open (no data packet for {SILENT_S:.0} s or more)"
+    )]
+}
+
 /// The setup of an accepted connection.
 pub fn link(conn: u64, settings: &ConnectionSettings, lab_latency_ms: u64, started_s: f64) -> SrtLink {
     SrtLink {
@@ -371,5 +434,62 @@ pub fn link(conn: u64, settings: &ConnectionSettings, lab_latency_ms: u64, start
         too_late_drop: settings.too_late_packet_drop,
         encryption_bits: settings.cipher.as_ref().map(|c| c.key_settings.key_size.as_usize() as u32 * 8),
         started_s,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(packets: u64) -> SocketStatistics {
+        let mut s = SocketStatistics::new();
+        s.rx_data = packets;
+        s.rx_unique_data = packets;
+        s
+    }
+
+    /// A sender that sends a few packets, then nothing while the connection stays open (an
+    /// srt-tokio sender whose send buffer overflowed): said once, and cleared when data comes back.
+    #[test]
+    fn a_sender_gone_quiet_on_an_open_connection_is_said() {
+        let mut st = SrtStats::default();
+        st.begin(SrtLink::default());
+        let mut said = vec![];
+        for (t, n) in [(1.0, 20), (2.0, 20), (3.0, 20), (4.0, 20), (5.0, 20), (6.0, 40)] {
+            said.extend(st.update(t, &at(n), 0).into_iter().map(|(l, m)| (t, l, m)));
+        }
+        let warns: Vec<_> = said.iter().filter(|(_, l, m)| *l == Level::Warn && m.contains("stopped sending")).collect();
+        assert_eq!(warns.len(), 1, "{said:?}");
+        assert_eq!(warns[0].0, 4.0, "3 s after the last data packet");
+        assert!(warns[0].2.contains("after 20 packet(s)"), "{}", warns[0].2);
+        assert!(said.iter().any(|(t, l, m)| *t == 6.0 && *l == Level::Info && m.contains("arriving again")));
+        assert!(!st.silent_warning);
+        assert_eq!(st.silences, 1);
+    }
+
+    /// Retransmissions arriving after their packet was played (the first copy got through) are
+    /// late, not dropped; a packet given up on that arrives later is one of each.
+    #[test]
+    fn needless_retransmissions_are_not_drops() {
+        let mut s = at(529);
+        s.rx_unique_data = 499;
+        s.rx_dropped_data = 30;
+        let c = SrtCounters::from_socket(&s, 0);
+        assert_eq!((c.dropped, c.late, c.missing), (0, 30, 0));
+        // 2 given up on, one of which came in afterwards
+        let mut s = at(501);
+        s.rx_unique_data = 500;
+        s.rx_dropped_data = 3;
+        let c = SrtCounters::from_socket(&s, 0);
+        assert_eq!((c.dropped, c.late, c.missing), (2, 1, 2));
+    }
+
+    #[test]
+    fn a_connection_that_never_sends_data_is_said() {
+        let mut st = SrtStats::default();
+        st.begin(SrtLink::default());
+        let said: Vec<_> = (1..=4).flat_map(|t| st.update(t as f64, &at(0), 0)).collect();
+        assert!(said.iter().any(|(_, m)| m.contains("since it opened")), "{said:?}");
+        assert!(st.silent_warning);
     }
 }
