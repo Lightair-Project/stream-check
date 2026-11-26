@@ -224,6 +224,9 @@ pub struct SrtStats {
     /// When the latest connection's last data packet arrived (or it opened).
     #[serde(skip)]
     last_data_t: f64,
+    /// All packets the latest connection had received then, control packets included.
+    #[serde(skip)]
+    last_data_all: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -250,6 +253,7 @@ impl SrtStats {
         self.last = None;
         self.window.clear();
         self.last_data_t = link.started_s;
+        self.last_data_all = 0;
         self.silent_warning = false;
         self.link = Some(link);
     }
@@ -280,7 +284,11 @@ impl SrtStats {
         let arrived = now.packets > self.last.map_or(0, |(_, c)| c.packets);
         if arrived {
             self.last_data_t = t;
+            self.last_data_all = s.rx_all_packets;
         }
+        // the sender is there while its control packets (keepalives: one a second when it sends
+        // nothing else) keep coming; a sender that went away without a word is a stall, not this
+        let alive = s.rx_all_packets.saturating_sub(self.last_data_all) >= 2;
         let Some((t0, before)) = self.last.replace((t, now)) else { return out };
         let dt = t - t0;
         if dt <= 0.0 {
@@ -344,7 +352,7 @@ impl SrtStats {
                 self.silent_warning = false;
                 out.push((Level::Info, "SRT: data packets are arriving again".to_string()));
             }
-        } else if !self.silent_warning && t - self.last_data_t >= SILENT_S {
+        } else if !self.silent_warning && alive && t - self.last_data_t >= SILENT_S {
             self.silent_warning = true;
             self.silences += 1;
             let what = if now.packets == 0 {
@@ -442,9 +450,15 @@ mod tests {
     use super::*;
 
     fn at(packets: u64) -> SocketStatistics {
+        with_control(packets, 0)
+    }
+
+    /// `packets` data packets, and `control` other packets (keepalives) received.
+    fn with_control(packets: u64, control: u64) -> SocketStatistics {
         let mut s = SocketStatistics::new();
         s.rx_data = packets;
         s.rx_unique_data = packets;
+        s.rx_all_packets = packets + control;
         s
     }
 
@@ -455,8 +469,9 @@ mod tests {
         let mut st = SrtStats::default();
         st.begin(SrtLink::default());
         let mut said = vec![];
-        for (t, n) in [(1.0, 20), (2.0, 20), (3.0, 20), (4.0, 20), (5.0, 20), (6.0, 40)] {
-            said.extend(st.update(t, &at(n), 0).into_iter().map(|(l, m)| (t, l, m)));
+        // a keepalive a second while no data comes
+        for (t, n, c) in [(1.0, 20, 0), (2.0, 20, 1), (3.0, 20, 2), (4.0, 20, 3), (5.0, 20, 4), (6.0, 40, 4)] {
+            said.extend(st.update(t, &with_control(n, c), 0).into_iter().map(|(l, m)| (t, l, m)));
         }
         let warns: Vec<_> = said.iter().filter(|(_, l, m)| *l == Level::Warn && m.contains("stopped sending")).collect();
         assert_eq!(warns.len(), 1, "{said:?}");
@@ -488,8 +503,22 @@ mod tests {
     fn a_connection_that_never_sends_data_is_said() {
         let mut st = SrtStats::default();
         st.begin(SrtLink::default());
-        let said: Vec<_> = (1..=4).flat_map(|t| st.update(t as f64, &at(0), 0)).collect();
+        let said: Vec<_> = (1..=4).flat_map(|t| st.update(t as f64, &with_control(0, t), 0)).collect();
         assert!(said.iter().any(|(_, m)| m.contains("since it opened")), "{said:?}");
         assert!(st.silent_warning);
+    }
+
+    /// A sender that finished and went away without closing (no keepalives either): the
+    /// connection waits out its idle timeout, which is not a sender that stopped sending.
+    #[test]
+    fn a_sender_gone_without_a_word_is_not_said_to_have_stopped_sending() {
+        let mut st = SrtStats::default();
+        st.begin(SrtLink::default());
+        let said: Vec<_> = [(1.0, 500), (2.0, 1000), (3.0, 1000), (4.0, 1000), (5.0, 1000), (6.0, 1000)]
+            .iter()
+            .flat_map(|&(t, n)| st.update(t, &at(n), 0))
+            .collect();
+        assert!(said.is_empty(), "{said:?}");
+        assert_eq!(st.silences, 0);
     }
 }
